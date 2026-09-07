@@ -68,5 +68,6 @@ desktop.ini
 # Local / temporary data (preserve directories with .gitkeep)
 data/*
 !data/.gitkeep
+data/inspection/
 tests/fixtures/*
 !tests/fixtures/.gitkeep
