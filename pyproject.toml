@@ -12,7 +12,9 @@ license = { text = "Proprietary" }
 authors = [
     { name = "SCM Team" }
 ]
-dependencies = []
+dependencies = [
+    "pywin32>=306; sys_platform == 'win32'",
+]
 
 [project.optional-dependencies]
 dev = [
