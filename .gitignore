@@ -71,3 +71,4 @@ data/*
 data/inspection/
 tests/fixtures/*
 !tests/fixtures/.gitkeep
+tests/fixtures/attachments/
