@@ -49,6 +49,7 @@ htmlcov/
 *.key
 *.token
 *.secret
+*.har
 
 # Logs
 *.log
