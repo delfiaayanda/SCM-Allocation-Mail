@@ -41,6 +41,12 @@ def main() -> int:
     try:
         summaries = scanner.scan()
     except Exception as err:
+        counters = scanner.run_counters()
+        counters["error_count"] += 1
+        try:
+            history_logger.record_run(args.folder, counters, dry_run)
+        except Exception as audit_err:
+            print(f"[SCM] AUDIT ERROR: {audit_err}", flush=True)
         print(f"[SCM] ERROR: {err}", flush=True)
         return 1
     counters = scanner.run_counters()

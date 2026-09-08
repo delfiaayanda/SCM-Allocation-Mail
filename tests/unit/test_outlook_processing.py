@@ -40,8 +40,9 @@ class FakeItem:
         subject: str = "Alokasi sample request",
         categories: str = "Blue Category, Important",
         attachment: FakeAttachment | None = None,
+        email_id: str = "stable-entry-id",
     ) -> None:
-        self.EntryID = "stable-entry-id"
+        self.EntryID = email_id
         self.Subject = subject
         self.SenderEmailType = "SMTP"
         self.SenderEmailAddress = "pm@erajaya.com"
@@ -84,22 +85,24 @@ class FakeCategories:
 
 
 class FakeItems:
-    def __init__(self, item: FakeItem) -> None:
-        self._item = item
-        self.Count = 1
+    def __init__(self, items: FakeItem | list[FakeItem], error_indices: set[int] | None = None) -> None:
+        self._items = items if isinstance(items, list) else [items]
+        self.Count = len(self._items)
+        self.error_indices = error_indices or set()
         self.sorted = False
 
     def Sort(self, field: str, descending: bool) -> None:
         self.sorted = True
 
     def __getitem__(self, index: int) -> FakeItem:
-        assert index == 1
-        return self._item
+        if index in self.error_indices:
+            raise RuntimeError("Outlook item is unavailable")
+        return self._items[index - 1]
 
 
 class FakeFolder:
-    def __init__(self, item: FakeItem) -> None:
-        self.Items = FakeItems(item)
+    def __init__(self, items: FakeItem | list[FakeItem], error_indices: set[int] | None = None) -> None:
+        self.Items = FakeItems(items, error_indices)
 
 
 class FakeNamespace:
@@ -268,6 +271,60 @@ def test_scanner_reports_connection_folder_and_scan_counts():
     ]
     assert scanner.last_scan_inspected == 1
     assert scanner.last_scan_candidates == 1
+
+
+def test_default_scan_catches_up_a_weekend_backlog_larger_than_100_items():
+    items = [
+        FakeItem(categories="", email_id=f"weekend-backlog-{index}")
+        for index in range(201)
+    ]
+    calls: list[str] = []
+
+    def extractor(email, **kwargs):
+        calls.append(email["entry_id"])
+        return result(ExtractionStatus.VALID)
+
+    scanner = OutlookEmailScanner(
+        config=OutlookScanConfig(dry_run=False),
+        extractor=extractor,
+    )
+    outlook = FakeOutlook(FakeFolder(items))
+
+    first_run = scanner.scan(outlook)
+    second_run = scanner.scan(outlook)
+
+    assert len(first_run) == 201
+    assert scanner.last_scan_total == 201
+    assert len(calls) == 201
+    assert all(item.Categories == SCRAPED_CATEGORY for item in items)
+    assert len(second_run) == 201
+    assert all(summary.skipped for summary in second_run)
+    assert scanner.run_counters()["skipped_already_processed"] == 201
+
+
+def test_outlook_item_retrieval_failure_is_reported_and_later_items_continue():
+    first = FakeItem(categories="", email_id="first")
+    unavailable = FakeItem(categories="", email_id="unavailable")
+    later = FakeItem(categories="", email_id="later")
+    calls: list[str] = []
+    messages: list[str] = []
+
+    def extractor(email, **kwargs):
+        calls.append(email["entry_id"])
+        return result(ExtractionStatus.VALID)
+
+    scanner = OutlookEmailScanner(
+        config=OutlookScanConfig(dry_run=True),
+        extractor=extractor,
+        progress_callback=messages.append,
+    )
+
+    summaries = scanner.scan(FakeOutlook(FakeFolder([first, unavailable, later], error_indices={2})))
+
+    assert [summary.email_id for summary in summaries] == ["first", "later"]
+    assert calls == ["first", "later"]
+    assert scanner.run_counters()["error_count"] == 1
+    assert any("ERROR retrieving Outlook item 2" in message for message in messages)
 
 
 def test_history_logger_writes_successful_rows_and_escapes_csv(tmp_path: Path):

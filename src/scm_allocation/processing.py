@@ -218,8 +218,13 @@ class OutlookEmailScanner:
         self.last_error_count = 0
 
         for index in range(1, fetch_count + 1):
-            item = items[index]
             self.last_scan_inspected += 1
+            try:
+                item = items[index]
+            except Exception as err:
+                self.last_error_count += 1
+                self._report_progress(f"ERROR retrieving Outlook item {index}: {err}")
+                continue
             subject = normalize_text(getattr(item, "Subject", "")) or ""
             if self.config.candidate_filter.is_excluded(subject):
                 self.last_invalid_or_excluded_count += 1
@@ -317,7 +322,7 @@ class OutlookEmailScanner:
             self._report_progress(
                 f"Subject: {summary.subject} | Status: {summary.extraction_status.value.upper()} | "
                 f"Planned category: {summary.category or 'None'} | Written: {summary.category_written}"
-                + (f" | failure: {summary.metadata.get('category_write_reason')}" if not summary.category_written and summary.category else "")
+                + f" | Write reason: {summary.metadata.get('category_write_reason') or 'written'}"
             )
 
     def _connect_outlook(self) -> Any:
