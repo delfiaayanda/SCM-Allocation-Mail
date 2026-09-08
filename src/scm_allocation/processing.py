@@ -31,9 +31,17 @@ class CandidateFilter:
     keywords: tuple[str, ...] = ("alokasi", "allocation")
     excluded_subjects: tuple[str, ...] = (OUT_OF_SCOPE_BATAM_SUBJECT,)
 
+    def is_excluded(self, subject: object) -> bool:
+        """Return whether an email is explicitly outside the allocation scope."""
+        normalized_subject = normalize_text(subject) or ""
+        return (
+            normalized_subject.casefold() in {value.casefold() for value in self.excluded_subjects}
+            or is_out_of_scope_email(normalized_subject)
+        )
+
     def matches(self, item: Any) -> bool:
         subject = normalize_text(getattr(item, "Subject", "")) or ""
-        if subject.casefold() in {value.casefold() for value in self.excluded_subjects} or is_out_of_scope_email(subject):
+        if self.is_excluded(subject):
             return False
 
         sender = get_sender_address(item)
@@ -58,7 +66,7 @@ class OutlookScanConfig:
     """Runtime settings for one bounded Outlook scan."""
 
     folder_name: str = "Inbox"
-    max_emails: int = 100
+    max_emails: Optional[int] = None
     dry_run: bool = True
     candidate_filter: CandidateFilter = field(default_factory=CandidateFilter)
 
@@ -151,15 +159,24 @@ class OutlookEmailScanner:
         extractor: Callable[..., ExtractionResult] = extract_email,
         progress_callback: Optional[Callable[[str], None]] = None,
         category_writer_factory: Optional[Callable[[Any], OutlookCategoryWriter]] = None,
+        history_logger: Optional[Any] = None,
     ) -> None:
         self.repository = repository or InMemoryEmailProcessingRepository()
         self.config = config or OutlookScanConfig()
         self.extractor = extractor
         self.progress_callback = progress_callback
         self.category_writer_factory = category_writer_factory or OutlookCategoryWriter
+        self.history_logger = history_logger
         self.last_scan_inspected = 0
         self.last_scan_candidates = 0
         self.last_scan_total = 0
+        self.last_processed_count = 0
+        self.last_skipped_already_processed = 0
+        self.last_scraped_count = 0
+        self.last_review_count = 0
+        self.last_invalid_or_excluded_count = 0
+        self.last_write_failure_count = 0
+        self.last_error_count = 0
 
     def _report_progress(self, message: str) -> None:
         if self.progress_callback:
@@ -182,7 +199,7 @@ class OutlookEmailScanner:
             total_count = int(getattr(items, "Count", 0))
         except (TypeError, ValueError):
             total_count = 0
-        fetch_count = min(self.config.max_emails, total_count)
+        fetch_count = total_count if self.config.max_emails is None else min(self.config.max_emails, total_count)
         self.last_scan_total = fetch_count
         self.last_scan_inspected = 0
         self.last_scan_candidates = 0
@@ -191,22 +208,47 @@ class OutlookEmailScanner:
         )
         summaries: list[ProcessingSummary] = []
         pending_writes: list[tuple[Any, ProcessingSummary]] = []
+        processed_items: list[tuple[Any, ProcessingSummary]] = []
+        self.last_processed_count = 0
+        self.last_skipped_already_processed = 0
+        self.last_scraped_count = 0
+        self.last_review_count = 0
+        self.last_invalid_or_excluded_count = 0
+        self.last_write_failure_count = 0
+        self.last_error_count = 0
 
         for index in range(1, fetch_count + 1):
             item = items[index]
             self.last_scan_inspected += 1
+            subject = normalize_text(getattr(item, "Subject", "")) or ""
+            if self.config.candidate_filter.is_excluded(subject):
+                self.last_invalid_or_excluded_count += 1
+                continue
             if not self.config.candidate_filter.matches(item):
                 continue
             self.last_scan_candidates += 1
             email_id = normalize_text(getattr(item, "EntryID", "")) or f"outlook-item-{index}"
             existing_categories = getattr(item, "Categories", "") or ""
-            if self.repository.is_processed(email_id) or SCRAPED_CATEGORY.casefold() in {
+            if {
+                SCRAPED_CATEGORY.casefold(), REVIEW_CATEGORY.casefold()
+            } & {
                 part.casefold() for part in _category_parts(existing_categories)
             }:
                 summaries.append(self._skipped_summary(item, email_id))
+                self.last_skipped_already_processed += 1
+                self._report_progress(f"SKIPPED_ALREADY_PROCESSED: {getattr(item, 'Subject', '<No Subject>')}")
                 continue
             summary = self._process_item(item, index, email_id)
             summaries.append(summary)
+            processed_items.append((item, summary))
+            self.last_processed_count += 1
+            if summary.extraction_status is ExtractionStatus.VALID:
+                self.last_scraped_count += 1
+            elif summary.extraction_status is ExtractionStatus.PARTIAL:
+                self.last_review_count += 1
+            else:
+                self.last_invalid_or_excluded_count += 1
+                self.last_error_count += bool(summary.error_information)
             if summary.category:
                 pending_writes.append((item, summary))
 
@@ -216,7 +258,32 @@ class OutlookEmailScanner:
         if not self.config.dry_run and pending_writes:
             self._report_write_summary(summaries, pending_writes)
             self._write_categories(pending_writes, getattr(namespace, "Categories", None))
+        if self.history_logger and not self.config.dry_run:
+            for item, summary in processed_items:
+                if (
+                    summary.extraction_status not in {ExtractionStatus.VALID, ExtractionStatus.PARTIAL}
+                    or not summary.category_written
+                ):
+                    continue
+                try:
+                    attachment_count = int(getattr(getattr(item, "Attachments", []), "Count", 0))
+                except (TypeError, ValueError):
+                    attachment_count = 0
+                self.history_logger.record_successful_processing(summary, attachment_count)
         return summaries
+
+    def run_counters(self) -> dict[str, int]:
+        return {
+            "scanned_count": self.last_scan_inspected,
+            "candidate_count": self.last_scan_candidates,
+            "processed_count": self.last_processed_count,
+            "skipped_already_processed": self.last_skipped_already_processed,
+            "scraped_count": self.last_scraped_count,
+            "review_count": self.last_review_count,
+            "invalid_or_excluded_count": self.last_invalid_or_excluded_count,
+            "write_failure_count": self.last_write_failure_count,
+            "error_count": self.last_error_count,
+        }
 
     def _report_write_summary(self, summaries: list[ProcessingSummary], pending_writes: list[tuple[Any, ProcessingSummary]]) -> None:
         valid_count = sum(summary.extraction_status is ExtractionStatus.VALID for summary in summaries)
@@ -241,9 +308,12 @@ class OutlookEmailScanner:
                 outcome = writer.apply_category(item, summary.category or "")
                 summary.category_written = outcome.written
                 summary.metadata["category_write_reason"] = outcome.reason
+                if not outcome.written and outcome.reason != "category already present":
+                    self.last_write_failure_count += 1
             except Exception as err:
                 summary.category_written = False
                 summary.metadata["category_write_reason"] = str(err)
+                self.last_write_failure_count += 1
             self._report_progress(
                 f"Subject: {summary.subject} | Status: {summary.extraction_status.value.upper()} | "
                 f"Planned category: {summary.category or 'None'} | Written: {summary.category_written}"

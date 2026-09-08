@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import csv
 
 import pytest
 
 from scm_allocation.models.allocation import ExtractionResult, ExtractionStatus
 from scm_allocation.ingestion.category_writer import OutlookCategoryWriter
+from scm_allocation.ingestion.history import CsvProcessingLogger
 from scm_allocation.processing import (
     REVIEW_CATEGORY,
     SCRAPED_CATEGORY,
@@ -123,7 +125,7 @@ def result(status: ExtractionStatus) -> ExtractionResult:
     return ExtractionResult([], status, "test_parser", "stable-entry-id", ("test detail",))
 
 
-def scanner_for(item: FakeItem, extraction: ExtractionResult, *, dry_run: bool, repository=None, calls=None):
+def scanner_for(item: FakeItem, extraction: ExtractionResult, *, dry_run: bool, repository=None, calls=None, history_logger=None):
     def extractor(email, **kwargs):
         if calls is not None:
             calls.append(email["entry_id"])
@@ -133,6 +135,7 @@ def scanner_for(item: FakeItem, extraction: ExtractionResult, *, dry_run: bool, 
         repository=repository,
         config=OutlookScanConfig(dry_run=dry_run, max_emails=1),
         extractor=extractor,
+        history_logger=history_logger,
     ), FakeOutlook(FakeFolder(item))
 
 
@@ -177,16 +180,31 @@ def test_write_mode_assigns_category_by_extraction_status(status, expected_categ
 
 def test_existing_bot_category_is_preserved_without_duplicate():
     item = FakeItem(categories=f"Blue Category, {SCRAPED_CATEGORY}")
-    scanner, outlook = scanner_for(item, result(ExtractionStatus.VALID), dry_run=False)
+    calls: list[str] = []
+    scanner, outlook = scanner_for(item, result(ExtractionStatus.VALID), dry_run=False, calls=calls)
 
     summary = scanner.scan(outlook)[0]
 
     assert summary.skipped is True
     assert summary.category_written is False
+    assert calls == []
     assert item.Categories == f"Blue Category, {SCRAPED_CATEGORY}"
 
 
-def test_repository_prevents_duplicate_valid_processing():
+def test_existing_review_category_is_skipped_without_extraction():
+    item = FakeItem(categories=f"Blue Category, {REVIEW_CATEGORY}")
+    calls: list[str] = []
+    scanner, outlook = scanner_for(item, result(ExtractionStatus.VALID), dry_run=True, calls=calls)
+
+    summary = scanner.scan(outlook)[0]
+
+    assert summary.skipped is True
+    assert calls == []
+    assert scanner.last_skipped_already_processed == 1
+    assert item.Categories == f"Blue Category, {REVIEW_CATEGORY}"
+
+
+def test_repository_state_does_not_skip_an_uncategorized_email():
     item = FakeItem(categories="")
     calls: list[str] = []
     repository = InMemoryEmailProcessingRepository()
@@ -196,16 +214,19 @@ def test_repository_prevents_duplicate_valid_processing():
     second = scanner.scan(outlook)[0]
 
     assert first.skipped is False
-    assert second.skipped is True
-    assert calls == ["stable-entry-id"]
+    assert second.skipped is False
+    assert calls == ["stable-entry-id", "stable-entry-id"]
     assert repository.is_processed("stable-entry-id") is True
-    assert repository.get_processing_status("stable-entry-id") == first
+    assert repository.get_processing_status("stable-entry-id") == second
 
 
-def test_batam_email_is_not_a_candidate_and_is_not_modified():
+def test_batam_email_is_not_a_candidate_or_history_row_and_is_not_modified(tmp_path: Path):
     item = FakeItem(subject="RE: STO DEVICE ALOKASI BATAM Asia Brand WK36 2026", categories="Blue Category")
     calls: list[str] = []
-    scanner, outlook = scanner_for(item, result(ExtractionStatus.VALID), dry_run=False, calls=calls)
+    logger = CsvProcessingLogger(tmp_path)
+    scanner, outlook = scanner_for(
+        item, result(ExtractionStatus.VALID), dry_run=False, calls=calls, history_logger=logger
+    )
 
     summaries = scanner.scan(outlook)
 
@@ -213,6 +234,8 @@ def test_batam_email_is_not_a_candidate_and_is_not_modified():
     assert calls == []
     assert item.Categories == "Blue Category"
     assert item.UnRead is True
+    assert scanner.run_counters()["invalid_or_excluded_count"] == 1
+    assert not logger.history_path.exists()
 
 
 def test_candidate_filter_is_conservative_and_configurable():
@@ -245,6 +268,131 @@ def test_scanner_reports_connection_folder_and_scan_counts():
     ]
     assert scanner.last_scan_inspected == 1
     assert scanner.last_scan_candidates == 1
+
+
+def test_history_logger_writes_successful_rows_and_escapes_csv(tmp_path: Path):
+    logger = CsvProcessingLogger(tmp_path, run_id="shared-run")
+    summary = ProcessingSummary(
+        "message,1",
+        'Subject "quoted", request',
+        "sender@example.com",
+        "2026-09-08T00:00:00Z",
+        "2026-09-08T01:00:00Z",
+        ExtractionStatus.VALID,
+        "html_request_matrix",
+        2,
+        SCRAPED_CATEGORY,
+        False,
+    )
+
+    summary.category_written = True
+    logger.record_successful_processing(summary, 1)
+
+    with (tmp_path / "allocation_bot_history.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["message_id"] == "message,1"
+    assert rows[0]["subject"] == 'Subject "quoted", request'
+    assert rows[0]["attachment_count"] == "1"
+    assert rows[0]["run_id"] == "shared-run"
+    assert rows[0]["actual_category"] == SCRAPED_CATEGORY
+
+
+def test_run_logger_records_counters_and_dry_run(tmp_path: Path):
+    logger = CsvProcessingLogger(tmp_path, run_id="shared-run")
+    counters = {
+        "scanned_count": 5,
+        "candidate_count": 2,
+        "processed_count": 1,
+        "skipped_already_processed": 1,
+        "scraped_count": 1,
+        "review_count": 0,
+        "invalid_or_excluded_count": 0,
+        "write_failure_count": 0,
+        "error_count": 0,
+    }
+
+    logger.record_run("Inbox", counters, True)
+
+    with (tmp_path / "allocation_bot_runs.csv").open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["folder"] == "Inbox"
+    assert row["skipped_already_processed"] == "1"
+    assert row["dry_run"] == "True"
+    assert row["run_id"] == "shared-run"
+
+
+def test_dry_run_does_not_write_successful_processing_history(tmp_path: Path):
+    item = FakeItem(categories="Blue Category")
+    logger = CsvProcessingLogger(tmp_path)
+    scanner, outlook = scanner_for(item, result(ExtractionStatus.VALID), dry_run=True, history_logger=logger)
+
+    scanner.scan(outlook)
+
+    assert not logger.history_path.exists()
+
+
+@pytest.mark.parametrize("status", [ExtractionStatus.INVALID, ExtractionStatus.UNSUPPORTED])
+def test_invalid_result_does_not_write_successful_processing_history(tmp_path: Path, status: ExtractionStatus):
+    item = FakeItem(categories="Blue Category")
+    logger = CsvProcessingLogger(tmp_path)
+    scanner, outlook = scanner_for(item, result(status), dry_run=False, history_logger=logger)
+
+    scanner.scan(outlook)
+
+    assert not logger.history_path.exists()
+
+
+def test_category_write_failure_does_not_write_successful_processing_history(tmp_path: Path):
+    class FailingWriter:
+        def __init__(self, categories):
+            pass
+
+        def apply_category(self, item, category):
+            from scm_allocation.ingestion.category_writer import CategoryWriteResult
+            return CategoryWriteResult(False, False, category, "category service unavailable")
+
+    item = FakeItem(categories="Blue Category")
+    logger = CsvProcessingLogger(tmp_path)
+    scanner, outlook = scanner_for(item, result(ExtractionStatus.VALID), dry_run=False, history_logger=logger)
+    scanner.category_writer_factory = FailingWriter
+
+    scanner.scan(outlook)
+
+    assert not logger.history_path.exists()
+    assert scanner.run_counters()["write_failure_count"] == 1
+
+
+def test_successful_live_category_persistence_writes_history(tmp_path: Path):
+    item = FakeItem(categories="Blue Category")
+    logger = CsvProcessingLogger(tmp_path, run_id="one-run")
+    scanner, outlook = scanner_for(item, result(ExtractionStatus.PARTIAL), dry_run=False, history_logger=logger)
+
+    scanner.scan(outlook)
+
+    with logger.history_path.open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["run_id"] == "one-run"
+    assert row["extraction_status"] == "partial"
+    assert row["planned_category"] == REVIEW_CATEGORY
+    assert row["actual_category"] == REVIEW_CATEGORY
+    assert row["category_written"] == "True"
+
+
+def test_history_and_run_rows_share_one_run_id(tmp_path: Path):
+    item = FakeItem(categories="Blue Category")
+    logger = CsvProcessingLogger(tmp_path, run_id="consistent-run")
+    scanner, outlook = scanner_for(item, result(ExtractionStatus.VALID), dry_run=False, history_logger=logger)
+
+    scanner.scan(outlook)
+    logger.record_run("Inbox", scanner.run_counters(), dry_run=False)
+
+    with logger.history_path.open(newline="", encoding="utf-8") as handle:
+        history_row = next(csv.DictReader(handle))
+    with logger.runs_path.open(newline="", encoding="utf-8") as handle:
+        run_row = next(csv.DictReader(handle))
+    assert history_row["run_id"] == run_row["run_id"] == "consistent-run"
+    assert run_row["processed_count"] == "1"
+    assert run_row["scraped_count"] == "1"
 
 
 def test_processing_summary_keeps_error_details():
