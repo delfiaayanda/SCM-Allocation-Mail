@@ -165,11 +165,13 @@ def test_dry_run_does_not_write_categories_or_read_state():
         (ExtractionStatus.UNSUPPORTED, None),
     ],
 )
-def test_write_mode_assigns_category_by_extraction_status(status, expected_category):
+def test_write_mode_assigns_category_and_preserves_unread_state(status, expected_category):
     item = FakeItem(categories="Blue Category, Important")
     scanner, outlook = scanner_for(item, result(status), dry_run=False)
 
+    unread_before = item.UnRead
     summaries = scanner.scan(outlook)
+    unread_after = item.UnRead
 
     assert summaries[0].category == expected_category
     assert summaries[0].category_written is (expected_category is not None)
@@ -177,7 +179,8 @@ def test_write_mode_assigns_category_by_extraction_status(status, expected_categ
         assert item.Categories == f"Blue Category, Important, {expected_category}"
     else:
         assert item.Categories == "Blue Category, Important"
-    assert item.UnRead is True
+    assert unread_before == unread_after
+    assert summaries[0].unread_status_preserved is True
     assert item.save_calls == (1 if expected_category else 0)
 
 
@@ -540,9 +543,13 @@ def test_category_failure_does_not_stop_later_category_write():
         ProcessingSummary("two", "Two", "two@example.com", "now", "now", ExtractionStatus.PARTIAL, "test", 1, REVIEW_CATEGORY, False),
     ]
 
+    first_unread_before = first.UnRead
+    second_unread_before = second.UnRead
     scanner._write_categories([(first, summaries[0]), (second, summaries[1])], categories)
 
     assert summaries[0].category_written is False
     assert "cannot accept" in summaries[0].metadata["category_write_reason"]
     assert summaries[1].category_written is True
     assert second.Categories == f"Blue Category, {REVIEW_CATEGORY}"
+    assert first.UnRead == first_unread_before
+    assert second.UnRead == second_unread_before
