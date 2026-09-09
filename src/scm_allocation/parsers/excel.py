@@ -99,8 +99,8 @@ def _simple_columns(ws: Any, header_row: int) -> Optional[dict[str, Optional[int
 
     marker_headers = {value.casefold() for value in headers if value}
     has_allocation_marker = bool(
-        {"request", "site code", "site desc", "from", "wh code", "warehouse code"} & marker_headers
-        or any(value and (value.casefold().startswith("gudang") or value.casefold().startswith("ur ")) for value in headers)
+        {"request", "site code", "site desc", "from", "wh code", "warehouse code", "store code", "store name", "plant code", "code store", "destinasi code", "alokasi", "qty", "quantity"} & marker_headers
+        or any(value and (value.casefold().startswith("gudang") or value.casefold().startswith("ur ") or value.casefold().startswith("store")) for value in headers)
     )
     if not has_allocation_marker:
         return None
@@ -304,7 +304,15 @@ def _row_values(ws: Any, row_number: int) -> list[Any]:
 
 def _is_total_or_empty(value: Any) -> bool:
     text = normalize_text(value)
-    return text is None or text.casefold() in {"grand total", "total"}
+    if text is None:
+        return True
+    lowered = text.casefold()
+    if lowered in {"grand total", "total", "subtotal"}:
+        return True
+    from scm_allocation.normalization.fields import canonical_field_name
+    if canonical_field_name(lowered) == "material_code":
+        return True
+    return False
 
 
 def _site_allocation_records(

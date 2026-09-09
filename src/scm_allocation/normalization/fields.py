@@ -15,6 +15,11 @@ FIELD_ALIASES: Mapping[str, tuple[str, ...]] = {
         "material code",
         "material sap",
         "sku",
+        "item code",
+        "item_code",
+        "kode item",
+        "kode barang",
+        "item",
     ),
     "material_description": (
         "article description",
@@ -26,6 +31,11 @@ FIELD_ALIASES: Mapping[str, tuple[str, ...]] = {
         "brand type 2",
         "material description",
         "desc",
+        "item description",
+        "item desc",
+        "nama barang",
+        "deskripsi item",
+        "description",
     ),
     "destination_plant_code": (
         "to store site code",
@@ -35,6 +45,9 @@ FIELD_ALIASES: Mapping[str, tuple[str, ...]] = {
         "plan",
         "plant",
         "plant code",
+        "store code",
+        "kode store",
+        "kode toko",
     ),
     "destination_plant_description": (
         "to store site desc",
@@ -43,15 +56,24 @@ FIELD_ALIASES: Mapping[str, tuple[str, ...]] = {
         "store",
         "plant_name",
         "plant desc",
+        "store name",
+        "store desc",
+        "nama store",
+        "nama toko",
+        "store description",
     ),
     "issuing_warehouse_code": (
         "from site code",
         "from warehouse",
         "warehouse code",
+        "wh code",
+        "plant asal",
+        "issuing warehouse",
     ),
     "issuing_warehouse_description": (
         "from site desc",
         "warehouse description",
+        "wh desc",
     ),
     "quantity": (
         "alokasi",
@@ -61,6 +83,7 @@ FIELD_ALIASES: Mapping[str, tuple[str, ...]] = {
         "qty request",
         "quantity",
         "sum of qty",
+        "jumlah",
     ),
 }
 
@@ -74,13 +97,36 @@ def normalize_text(value: Any) -> Optional[str]:
 
 
 def normalize_material_code(value: Any) -> Optional[str]:
-    text = normalize_text(value)
+    if value is None:
+        return None
 
-    if text is None or text.lower() in {"grand total", "total"}:
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.0f}"
+
+    if isinstance(value, int):
+        return str(value)
+
+    text = normalize_text(value)
+    if text is None:
+        return None
+
+    lowered = text.casefold()
+    if lowered in {"grand total", "total", "item code", "article code", "material", "material code", "sku"}:
         return None
 
     if re.fullmatch(r"\d+\.0", text):
         return text[:-2]
+
+    if re.fullmatch(r"\d+(\.\d+)?[eE][+-]?\d+", text):
+        try:
+            val = float(text)
+            if val.is_integer():
+                return str(int(val))
+            return f"{val:.0f}"
+        except (ValueError, OverflowError):
+            pass
 
     return text
 

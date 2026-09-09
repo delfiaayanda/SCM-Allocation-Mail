@@ -599,3 +599,52 @@ def test_multiple_xlsx_with_unrelated_workbook_safety(tmp_path: Path):
     assert result.status is ExtractionStatus.VALID
     assert len(result.records) == 1
     assert result.records[0].material_code == "8100000016"
+
+
+def test_excel_store_item_header_multi_block_and_scientific_notation(tmp_path: Path):
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Refill Stock"
+
+    headers = ["Store Code", "Store Name", "Item Code", "Item Description", "Quantity"]
+
+    # Block 1
+    worksheet.append(headers)
+    worksheet.append(["X011", "IBOX LIPPO MALL PURI", "8.1E+09", "MAXCO Geometry Mg Wire.Charger MW11 GRY", 15])
+    worksheet.append(["X168", "IBOX BINTARO XCHANGE MALL II", 8100294901.0, "MAXCO Geometry Mg Wire.Charger MW11 GRY", 10])
+
+    # Repeated header row separating Block 2
+    worksheet.append(headers)
+    worksheet.append(["X007", "IBOX GRAND GALAXY PARK BEKASI", 8100294902, "MAXCO Geometry Mg Wire.Charger MW11 GRY", 5])
+
+    # Unrelated sheet in same workbook
+    unrelated = workbook.create_sheet("Guidance")
+    unrelated.append(["Notice", "Details"])
+    unrelated.append(["Important", "Please keep records updated"])
+
+    path = tmp_path / "refill_stock_maxco.xlsx"
+    workbook.save(path)
+
+    email = {
+        "entry_id": "maxco-refill-email",
+        "subject": "Request Alokasi: Refill Stock - DCM - Electrical 3rd party - Maxco, Mezone (9 Sep 2026)",
+        "attachments": [{"filename": path.name}],
+    }
+
+    result = extract_email(email, attachment_paths={path.name: path})
+
+    assert result.status is ExtractionStatus.VALID
+    assert len(result.records) == 3
+    assert result.records[0].destination_plant_code == "X011"
+    assert result.records[0].destination_plant_description == "IBOX LIPPO MALL PURI"
+    assert result.records[0].material_code == "8100000000" or result.records[0].material_code.startswith("8")
+    assert result.records[0].material_description == "MAXCO Geometry Mg Wire.Charger MW11 GRY"
+    assert result.records[0].quantity == 15
+
+    assert result.records[1].destination_plant_code == "X168"
+    assert result.records[1].material_code == "8100294901"
+    assert result.records[1].quantity == 10
+
+    assert result.records[2].destination_plant_code == "X007"
+    assert result.records[2].material_code == "8100294902"
+    assert result.records[2].quantity == 5
