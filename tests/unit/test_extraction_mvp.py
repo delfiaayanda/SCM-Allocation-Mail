@@ -93,6 +93,7 @@ def test_malformed_flat_row_returns_partial_record():
     assert "missing or invalid quantity" in result.records[0].errors
 
 
+@pytest.mark.skipif(not (INSPECTION / "email_001.json").exists(), reason="local email fixture is unavailable")
 def test_batam_email_is_skipped_before_attachment_parsing():
     email = load_email(1)
     result = extract_email(email)
@@ -537,3 +538,64 @@ def test_html_headers_with_blank_cells_return_controlled_status():
         result = parse_html(html)
 
         assert result.status in {ExtractionStatus.INVALID, ExtractionStatus.PARTIAL}
+
+
+def test_attachment_order_independence_and_non_xlsx_filtering(tmp_path: Path):
+    workbook = openpyxl.Workbook()
+    _add_simple_allocation_sheet(workbook, "Request", [["8100000015", "Order Test Item", "X015", "Order Store", 5]])
+    xlsx_path = tmp_path / "allocation.xlsx"
+    workbook.save(xlsx_path)
+
+    email = {
+        "entry_id": "order-test",
+        "subject": "Request Allocation with multiple asset attachments",
+        "attachments": [
+            {"filename": "image001.gif"},
+            {"filename": "company_logo.png"},
+            {"filename": "signature.htm"},
+            {"filename": xlsx_path.name},
+            {"filename": "banner.jpg"},
+        ],
+    }
+
+    result = extract_email(email, attachment_paths={xlsx_path.name: xlsx_path})
+
+    assert result.status is ExtractionStatus.VALID
+    assert len(result.records) == 1
+    assert result.records[0].material_code == "8100000015"
+    assert [diag["status"] for diag in result.metadata["attachment_diagnostics"]] == [
+        "ignored", "ignored", "ignored", "selected", "ignored"
+    ]
+
+
+def test_multiple_xlsx_with_unrelated_workbook_safety(tmp_path: Path):
+    valid_wb = openpyxl.Workbook()
+    _add_simple_allocation_sheet(valid_wb, "Request", [["8100000016", "Valid Item", "X016", "Valid Store", 10]])
+    valid_path = tmp_path / "allocation.xlsx"
+    valid_wb.save(valid_path)
+
+    unrelated_wb = openpyxl.Workbook()
+    sheet = unrelated_wb.active
+    sheet.title = "Instructions"
+    sheet.append(["Policy Name", "Description"])
+    sheet.append(["SCM Guideline", "Standard operating procedure"])
+    unrelated_path = tmp_path / "instructions.xlsx"
+    unrelated_wb.save(unrelated_path)
+
+    email = {
+        "entry_id": "multi-xlsx-unrelated",
+        "subject": "Allocation and Instructions",
+        "attachments": [
+            {"filename": valid_path.name},
+            {"filename": unrelated_path.name},
+        ],
+    }
+
+    result = extract_email(
+        email,
+        attachment_paths={valid_path.name: valid_path, unrelated_path.name: unrelated_path},
+    )
+
+    assert result.status is ExtractionStatus.VALID
+    assert len(result.records) == 1
+    assert result.records[0].material_code == "8100000016"

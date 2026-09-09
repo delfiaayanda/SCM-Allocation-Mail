@@ -109,6 +109,71 @@ python -m pip install -e ".[dev]"
 .\.venv\Scripts\pytest.exe -v --basetemp .pytest-final-validation
 ```
 
+## End-to-End Demo
+
+### 1. Prerequisites
+- Windows OS with Microsoft Outlook desktop installed and logged in.
+- Virtual environment activated with project dependencies (`pip install -e ".[dev]"` or `poetry install`).
+
+### 2. Exact Command
+To run a safe live scan of your Outlook Inbox in dry-run mode:
+```powershell
+python scripts/process_outlook_allocations.py --folder Inbox
+```
+You can optionally inspect only the newest $N$ messages:
+```powershell
+python scripts/process_outlook_allocations.py --folder Inbox --max-emails 10
+```
+
+### 3. What the Command Does
+1. Connects to Outlook desktop via MAPI COM (`pywin32`).
+2. Filters emails by sender domain (`erajaya.com`), keywords (`alokasi`, `allocation`), and excludes out-of-scope subjects (e.g. Batam).
+3. Applies duplicate guard based on Outlook Categories (`SCM Bot - Scraped`, `SCM Bot - Review`); already categorized messages are skipped.
+4. Filters non-XLSX attachments (logos, images, `.htm` signatures) regardless of attachment order.
+5. Dispatches candidate `.xlsx` workbooks to appropriate Excel/HTML parsers.
+6. Normalizes SLocs, plant codes, and quantities into traceable `AllocationRecord[]` objects.
+7. Logs execution metrics and counters to `logs/allocation_bot_runs.csv`.
+
+### 4. Dry-Run Safety Behavior
+By default (without `--write-categories`):
+- Read-only execution: does NOT send, delete, move, or modify emails.
+- Preserves `UnRead` flag state.
+- Does NOT apply Outlook categories.
+- Does NOT write to `logs/allocation_bot_history.csv`.
+
+### 5. Expected Output
+The CLI displays progress, email summaries, parser diagnostics, and extracted records:
+```text
+[SCM] Starting Outlook allocation scan (folder=Inbox, max_emails=10, dry_run=True).
+[SCM] Connected to Outlook.
+[SCM] Scanning folder: Inbox.
+Subject: Request Alokasi NPI Anker | Email ID: 0000... | Status: VALID | Parser: excel_site_material_matrix | records=10 | Planned category: SCM Bot - Scraped | Written: False
+  workbook=npi_anker.xlsx sheet=Sheet1 -> matched: excel_site_material_matrix records=10
+  -> AllocationRecord: material=8100294900 (ANK Charger 0) qty=1 from=<none> (sloc=1001) to=X015 (sloc=1001) context=accessories src=npi_anker.xlsx/Sheet1 row=3
+Scanned: 10
+Candidates: 1
+Processed: 1
+Skipped already processed: 0
+Scraped: 1
+Review: 0
+Invalid/Excluded: 0
+Dry-run: True
+```
+
+### 6. Category Persistence (--write-categories)
+When run with the explicit opt-in flag:
+```powershell
+python scripts/process_outlook_allocations.py --folder Inbox --write-categories
+```
+- Messages yielding `VALID` extraction receive category `SCM Bot - Scraped`.
+- Messages yielding `PARTIAL` extraction receive category `SCM Bot - Review`.
+- Successfully categorized runs record processed email details to `logs/allocation_bot_history.csv`.
+
+### 7. Known Limitations
+- Outlook COM automation requires Windows OS with desktop Outlook running.
+- Unsupported or malformed attachments yield `INVALID` status and do not fabricate records.
+- Database persistence is out of scope for this repository; a downstream consumer will ingest `AllocationRecord[]` into PostgreSQL.
+
 ## Security and handoff
 - Never commit credentials, passwords, OAuth tokens, or secrets.
 - Never commit confidential production emails or sensitive employee personal data to version control.
