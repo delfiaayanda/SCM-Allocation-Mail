@@ -378,7 +378,7 @@ class OutlookEmailScanner:
             error_information=errors,
             review_information=review,
             unread_status_preserved=unread_before == unread_after,
-            metadata=result.metadata,
+            metadata={**result.metadata, "records": result.records},
         )
         self.repository.record_result(email_id, summary)
         return summary

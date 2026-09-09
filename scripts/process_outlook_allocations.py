@@ -61,7 +61,7 @@ def main() -> int:
         detail_text = f" | details={' ; '.join(details)}" if details else ""
         status = "SKIPPED_ALREADY_PROCESSED" if summary.skipped else summary.extraction_status.value.upper()
         print(
-            f"Subject: {summary.subject} | Status: {status} | "
+            f"Subject: {summary.subject} | Email ID: {summary.email_id} | Status: {status} | "
             f"Parser: {summary.parser_type} | records={summary.record_count} | "
             f"Planned category: {summary.category or 'None'} | Written: {summary.category_written}"
             f"{detail_text}",
@@ -75,6 +75,15 @@ def main() -> int:
             records = diagnostic.get("records")
             record_text = f" records={records}" if records is not None else ""
             print(f"  workbook={workbook} sheet={sheet} -> {status}: {detail}{record_text}", flush=True)
+        for record in summary.metadata.get("records", []):
+            context_val = record.allocation_context.value if hasattr(record.allocation_context, "value") else str(record.allocation_context)
+            print(
+                f"  -> AllocationRecord: material={record.material_code or '<none>'} ({record.material_description or ''}) "
+                f"qty={record.quantity} from={record.issuing_warehouse_code or '<none>'} (sloc={record.issuing_warehouse_sloc or '<none>'}) "
+                f"to={record.destination_plant_code or '<none>'} (sloc={record.destination_sloc or '<none>'}) "
+                f"context={context_val} src={record.source_filename or ''}/{record.source_sheet or ''} row={record.source_row}",
+                flush=True,
+            )
     print(f"Scanned: {counters['scanned_count']}", flush=True)
     print(f"Candidates: {counters['candidate_count']}", flush=True)
     print(f"Processed: {counters['processed_count']}", flush=True)
