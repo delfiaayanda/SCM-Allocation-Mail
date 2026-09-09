@@ -120,8 +120,8 @@ def extract_email(
         for result in excel_results:
             parser_types.add(result.parser_type)
             errors.extend(result.errors)
-            attachment_diagnostics = result.metadata.get("worksheet_diagnostics", [])
-            diagnostics.extend(attachment_diagnostics)
+            worksheet_diagnostics = result.metadata.get("worksheet_diagnostics", [])
+            diagnostics.extend(worksheet_diagnostics)
             for record in result.records:
                 identity = (
                     record.material_code,

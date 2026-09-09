@@ -1,6 +1,7 @@
 """Unit tests for attachment collection and manifest generation."""
 
 from pathlib import Path
+import sys
 from unittest.mock import MagicMock
 import json
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from scm_allocation.ingestion.collector import collect_attachments
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Requires Windows OS with Outlook")
 def test_collect_attachments_mocked(tmp_path: Path, monkeypatch):
     """Verify attachment copying and manifest structure using mocked COM objects."""
     # Create mock attachment
