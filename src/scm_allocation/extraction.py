@@ -12,6 +12,31 @@ from scm_allocation.parsers import parse_excel, parse_html
 
 
 OUT_OF_SCOPE_BATAM_SUBJECT = "re: sto device alokasi batam asia brand wk36 2026"
+SUPPORTED_ATTACHMENT_EXTENSIONS = frozenset({".xlsx"})
+
+
+def is_allocation_attachment_filename(filename: object) -> bool:
+    """Return whether an attachment is a supported allocation workbook candidate."""
+    normalized = normalize_text(filename)
+    return bool(normalized and Path(normalized).suffix.casefold() in SUPPORTED_ATTACHMENT_EXTENSIONS)
+
+
+def classify_attachments(attachments: object) -> tuple[list[Mapping[str, object]], list[dict[str, object]]]:
+    """Select supported workbook candidates and retain non-sensitive selection diagnostics."""
+    selected: list[Mapping[str, object]] = []
+    diagnostics: list[dict[str, object]] = []
+    for attachment in attachments if isinstance(attachments, list) else []:
+        if not isinstance(attachment, Mapping):
+            diagnostics.append({"status": "ignored", "reason": "attachment metadata is not a mapping"})
+            continue
+        filename = normalize_text(attachment.get("filename"))
+        extension = Path(filename).suffix.casefold() if filename else ""
+        if is_allocation_attachment_filename(filename):
+            selected.append(attachment)
+            diagnostics.append({"filename": filename, "extension": extension, "status": "selected", "reason": "supported Excel workbook"})
+        else:
+            diagnostics.append({"filename": filename or "<unnamed>", "extension": extension, "status": "ignored", "reason": "unsupported attachment extension"})
+    return selected, diagnostics
 
 
 def is_out_of_scope_email(subject: object) -> bool:
@@ -58,13 +83,11 @@ def extract_email(
             ("Batam PPBJ email is outside the allocation extraction scope",),
         )
 
-    attachments = email.get("attachments") or []
+    attachments, attachment_diagnostics = classify_attachments(email.get("attachments") or [])
     excel_results: list[ExtractionResult] = []
     for attachment in attachments:
-        if not isinstance(attachment, Mapping):
-            continue
         filename = normalize_text(attachment.get("filename"))
-        if not filename or not filename.casefold().endswith(".xlsx"):
+        if not filename:
             continue
         filepath = attachment_paths.get(filename) if attachment_paths else None
         if filepath is None or not filepath.exists():
@@ -118,7 +141,7 @@ def extract_email(
                 status,
                 parser_type,
                 source_email_id,
-                metadata={"worksheet_diagnostics": diagnostics},
+                metadata={"worksheet_diagnostics": diagnostics, "attachment_diagnostics": attachment_diagnostics},
             )
         return ExtractionResult(
             [],
@@ -126,18 +149,20 @@ def extract_email(
             next(iter(parser_types)) if len(parser_types) == 1 else "excel_multi_attachment",
             source_email_id,
             tuple(errors) or ("no allocation worksheet found",),
-            metadata={"worksheet_diagnostics": diagnostics},
+            metadata={"worksheet_diagnostics": diagnostics, "attachment_diagnostics": attachment_diagnostics},
         )
 
     html_body = email.get("body_html")
     if normalize_text(html_body):
         plant_code, plant_description = _extract_email_plant(email)
-        return parse_html(
+        html_result = parse_html(
             str(html_body),
             source_email_id=source_email_id,
             destination_plant_code=plant_code,
             destination_plant_description=plant_description,
         )
+        html_result.metadata = {**html_result.metadata, "attachment_diagnostics": attachment_diagnostics}
+        return html_result
 
     return ExtractionResult(
         [],
@@ -145,4 +170,5 @@ def extract_email(
         "format_detection",
         source_email_id,
         ("email has no supported Excel attachment or HTML body",),
+        metadata={"attachment_diagnostics": attachment_diagnostics},
     )

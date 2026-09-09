@@ -1,18 +1,8 @@
-# SCM-Allocation-Mail
+# SCM Allocation Mail
 
-Automated collection, extraction, and validation of allocation requests sent by PM/CM to the SCM department via Microsoft Outlook.
+Safely scans Outlook allocation-request emails, extracts supported HTML/XLSX structures into traceable `AllocationRecord` values, and optionally applies Outlook processing categories. It is deliberately independent of PostgreSQL; a later persistence layer can consume its structured records.
 
-## 1. Overview
-
-PM/CM sends allocation requests to SCM across varied formats, including:
-- Plain text email bodies
-- HTML tables with varying structures, column names, and column orders
-- Excel attachments (.xlsx, .xls)
-- Hybrid messages (email body summary + Excel attachment)
-
-This system automates the ingestion, parsing, normalization, validation against master reference data, and consolidation of these requests into a canonical structured format while preserving complete traceability.
-
-## 2. Architecture & Pipeline
+## Pipeline
 
 ```text
 Outlook Email (or Local Sample)
@@ -20,25 +10,61 @@ Outlook Email (or Local Sample)
      Email Filtering
             ↓
     Content Extraction
-    ├── Plain Text Parser
-    ├── HTML Body Parser
-    ├── HTML Table Parser
-    └── Excel Attachment Parser
+    ├── HTML table parser
+    └── Excel attachment parser
             ↓
 Field Detection & Normalization
             ↓
-  Master Data Validation (WH, Plant, Material)
+  Normalization / SLoc defaults
             ↓
- Structured Allocation Request
+ Structured `AllocationRecord`
             ↓
       Output / Report
 ```
 
-### Core Design Principles
-- **Accuracy & Traceability**: Preserve original extracted values, email metadata, timestamps, and parser methods for auditability.
-- **Strict Validation**: Distinct statuses (`VALID`, `INVALID`, `MISSING`, `AMBIGUOUS`, `UNMATCHED`). Never guess or hallucinate business data.
-- **Sample-First Development**: Parsers are designed and tested against real-world sample patterns before production deployment.
-- **Layer Separation**: Parsing and normalization logic are decoupled from Outlook COM / MAPI integration to enable robust offline testing.
+## Operating safely
+
+Windows, Outlook desktop, and `pywin32` are required for live Outlook scans. The default command is read-only with respect to Outlook:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\process_outlook_allocations.py --folder Inbox
+```
+
+Only this explicit command may persist Outlook Categories:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\process_outlook_allocations.py --folder Inbox --write-categories
+```
+
+The bot never moves, deletes, replies to, forwards, changes body/attachments, or changes `UnRead`. `VALID` receives `SCM Bot - Scraped`; `PARTIAL` receives `SCM Bot - Review`; INVALID, unsupported, and Batam/out-of-scope messages receive no bot category.
+
+Already categorized messages are skipped before extraction. Outlook Categories—not subject, attachment name, in-memory repository state, or CSV history—are the authoritative duplicate guard.
+
+## Supported extraction formats
+
+- Compound allocation grids.
+- Destination and warehouse/destination matrices.
+- Simple Excel tables and site-only review tables.
+- NPI wide site/material matrices (material codes above descriptions).
+- IT/LOOPS new-store tables with source/destination SLoc columns.
+- Supported flat HTML and request/pivot HTML tables.
+
+Unsupported or malformed attachments produce controlled INVALID diagnostics; they do not fabricate allocation records.
+
+## Storage-location rules
+
+Explicit workbook source/destination SLoc values always win. When source SLoc is absent, BGC1/BHC1/BIC1/BFC1 use `1005` for DEVICE context and `1001` for NON-DEVICE or uncertain context. A destination with no explicit SLoc defaults to `1001`.
+
+## Output and audit
+
+`AllocationRecord` keeps material, quantity, source/destination warehouse and SLoc values, context, parser/status/confidence/errors, and source email/file/sheet/row/cell traceability. This is ready for a PostgreSQL mapper without coupling the parser to a database.
+
+Local audit files are ignored by Git:
+
+- `logs/allocation_bot_history.csv`: successful live category persistence only.
+- `logs/allocation_bot_runs.csv`: every scanner run and counters.
+
+## Setup and tests
 
 ## 3. Project Structure
 
@@ -78,11 +104,11 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-### Running Tests
+### Run tests
 ```powershell
-.\.venv\Scripts\pytest
+.\.venv\Scripts\pytest.exe -v --basetemp .pytest-final-validation
 ```
 
-## 5. Security & Privacy
+## Security and handoff
 - Never commit credentials, passwords, OAuth tokens, or secrets.
 - Never commit confidential production emails or sensitive employee personal data to version control.

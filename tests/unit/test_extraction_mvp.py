@@ -11,6 +11,7 @@ import pytest
 from scm_allocation.extraction import extract_email, is_out_of_scope_email
 from scm_allocation.models.allocation import ExtractionStatus
 from scm_allocation.models.reference import AllocationContext
+from scm_allocation.normalization import resolve_storage_locations
 from scm_allocation.parsers import parse_html
 from scm_allocation.parsers.excel import parse_excel
 
@@ -18,7 +19,9 @@ from scm_allocation.parsers.excel import parse_excel
 ROOT = Path(__file__).resolve().parents[2]
 INSPECTION = ROOT / "data" / "inspection"
 ATTACHMENTS = ROOT / "tests" / "fixtures" / "attachments"
-EXCEL = next(ATTACHMENTS.glob("*.xlsx"), None)
+EXCEL = ATTACHMENTS / "Alokasi Logitech BIC1 to iBox BCA XE05 7 September.xlsx"
+if not EXCEL.exists():
+    EXCEL = None
 
 
 def load_email(index: int) -> dict:
@@ -285,6 +288,146 @@ def test_excel_destination_matrix_uses_one_non_destination_code_as_warehouse(tmp
     assert len(result.records) == 1
     assert result.records[0].destination_plant_code == "F233"
     assert result.records[0].issuing_warehouse_code == "BGC1"
+
+
+def test_excel_npi_wide_site_material_matrix_extracts_each_material(tmp_path: Path):
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Sheet1"
+    worksheet.append([None, None, "8100294963", "8100294964"])
+    worksheet.append(["Site Code", "Site Desc", "ANK NANO CHARGER 45W - BLUE", "ANK POWERBANK 25K"])
+    worksheet.append(["X015", "IBOX APP PLAZA INDONESIA", 5, 3])
+    path = tmp_path / "npi_wide_matrix.xlsx"
+    workbook.save(path)
+
+    result = parse_excel(path, source_email_id="npi-email")
+
+    assert result.status is ExtractionStatus.VALID
+    assert result.parser_type == "excel_site_material_matrix"
+    assert [(record.material_code, record.quantity) for record in result.records] == [("8100294963", 5), ("8100294964", 3)]
+    assert {record.destination_plant_code for record in result.records} == {"X015"}
+    assert {record.destination_plant_description for record in result.records} == {"IBOX APP PLAZA INDONESIA"}
+    assert {record.destination_sloc for record in result.records} == {"1001"}
+
+
+def test_extract_email_dispatches_npi_attachment_to_site_material_matrix(tmp_path: Path):
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    material_codes = [f"81002949{index:02d}" for index in range(10)]
+    worksheet.append([None, None, *material_codes])
+    worksheet.append(["Site Code", "Site Desc", *[f"ANK Charger {index}" for index in range(10)]])
+    worksheet.append(["X015", "IBOX APP PLAZA INDONESIA", *range(1, 11)])
+    path = tmp_path / "npi_anker.xlsx"
+    workbook.save(path)
+
+    result = extract_email(
+        {"entry_id": "npi-email", "subject": "Request Alokasi NPI Anker", "attachments": [{"filename": "Untitled attachment 00418.htm"}, {"filename": path.name}]},
+        attachment_paths={path.name: path},
+    )
+
+    assert result.status is ExtractionStatus.VALID
+    assert result.parser_type == "excel_site_material_matrix"
+    assert len(result.records) == 10
+    assert {record.source_email_id for record in result.records} == {"npi-email"}
+    assert {record.source_filename for record in result.records} == {path.name}
+    assert [item["status"] for item in result.metadata["attachment_diagnostics"]] == ["ignored", "selected"]
+
+
+def test_excel_new_store_it_and_loops_preserve_explicit_source_and_destination_sloc(tmp_path: Path):
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)
+    headers = ["No", "Article Number (SAP Code)", "Material Description", "Qty", "Plant Asal", "Storage Location (Sloc)", "Plant Code", "Storage Location (Sloc)"]
+    for sheet_name, material, quantity in (("IT", "IT1 USB C Cable", 10), ("LOOPS", "LOP Cable A to C", 5)):
+        worksheet = workbook.create_sheet(sheet_name)
+        worksheet.append(headers)
+        worksheet.append([1, "8100013184", material, quantity, "BCC1", "1001", "F233", "1001"])
+    stores = workbook.create_sheet("Stores")
+    stores.append(["List New Store", None])
+    stores.append(["F233", "ERAFONE PALU GRAND MALL"])
+    path = tmp_path / "new_store.xlsx"
+    workbook.save(path)
+
+    result = parse_excel(path, source_email_id="new-store-email")
+
+    assert result.status is ExtractionStatus.VALID
+    assert result.parser_type == "excel_new_store_table"
+    assert {record.source_sheet for record in result.records} == {"IT", "LOOPS"}
+    assert {record.destination_plant_description for record in result.records} == {"ERAFONE PALU GRAND MALL"}
+    assert {record.issuing_warehouse_code for record in result.records} == {"BCC1"}
+    assert {record.issuing_warehouse_sloc for record in result.records} == {"1001"}
+    assert {record.destination_sloc for record in result.records} == {"1001"}
+
+
+def test_extract_email_dispatches_new_store_attachment_across_it_and_loops(tmp_path: Path):
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)
+    headers = ["No", "Article Number (SAP Code)", "Material Description", "Qty", "Plant Asal", "Storage Location (Sloc)", "Plant Code", "Storage Location (Sloc)"]
+    for sheet_name, start in (("IT", 0), ("LOOPS", 7)):
+        worksheet = workbook.create_sheet(sheet_name)
+        worksheet.append(headers)
+        for row_number in range(7):
+            worksheet.append([row_number + 1, f"810000{start + row_number:04d}", f"{sheet_name} Cable {row_number}", row_number + 1, "BCC1", "1001", "F233", "1001"])
+    stores = workbook.create_sheet("Stores")
+    stores.append(["List New Store", None])
+    stores.append(["F233", "ERAFONE PALU GRAND MALL"])
+    path = tmp_path / "new_store_it_loops.xlsx"
+    workbook.save(path)
+
+    result = extract_email(
+        {"entry_id": "new-store-email", "subject": "STO CC IT LOOPS Alokasi New Store", "attachments": [{"filename": "image001.gif"}, {"filename": path.name}]},
+        attachment_paths={path.name: path},
+    )
+
+    assert result.status is ExtractionStatus.VALID
+    assert result.parser_type == "excel_new_store_table"
+    assert len(result.records) == 14
+    assert {record.source_sheet for record in result.records} == {"IT", "LOOPS"}
+    assert {record.destination_plant_description for record in result.records} == {"ERAFONE PALU GRAND MALL"}
+    assert [item["status"] for item in result.metadata["attachment_diagnostics"]] == ["ignored", "selected"]
+
+
+def test_extract_email_reports_a_malformed_excel_attachment_without_records(tmp_path: Path):
+    path = tmp_path / "malformed.xlsx"
+    path.write_bytes(b"not an Excel workbook")
+
+    result = extract_email(
+        {"entry_id": "bad-attachment", "subject": "Allocation request", "attachments": [{"filename": path.name}]},
+        attachment_paths={path.name: path},
+    )
+
+    assert result.status is ExtractionStatus.INVALID
+    assert result.records == []
+    assert result.errors
+
+
+@pytest.mark.parametrize("source", ["BGC1", "BHC1", "BIC1", "BFC1"])
+def test_central_source_defaults_device_and_non_device_sloc_when_absent(tmp_path: Path, source: str):
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.append(["Material", "Material description", "Warehouse Code", "Site Code", "Qty"])
+    worksheet.append(["8100000101", "MacBook Air", source, "X001", 1])
+    worksheet.append(["8100000102", "USB C Cable", source, "X001", 2])
+    path = tmp_path / f"central_{source}.xlsx"
+    workbook.save(path)
+
+    result = parse_excel(path)
+
+    assert result.status is ExtractionStatus.VALID
+    assert [record.issuing_warehouse_sloc for record in result.records] == ["1005", "1001"]
+    assert {record.destination_sloc for record in result.records} == {"1001"}
+
+
+def test_explicit_storage_locations_override_central_and_destination_defaults():
+    source_sloc, destination_sloc = resolve_storage_locations(
+        issuing_warehouse_code="BIC1",
+        allocation_context=AllocationContext.DEVICE,
+        explicit_issuing_sloc="1999",
+        explicit_destination_sloc="1888",
+        destination_plant_code="RDC1",
+    )
+
+    assert source_sloc == "1999"
+    assert destination_sloc == "1888"
 
 
 def test_html_code_store_request_aliases_are_supported():

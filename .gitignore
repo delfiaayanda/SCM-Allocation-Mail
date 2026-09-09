@@ -33,6 +33,7 @@ env/
 
 # Testing and coverage
 .pytest_cache/
+/.pytest-*/
 .coverage
 .coverage.*
 nosetests.xml
@@ -54,6 +55,7 @@ htmlcov/
 # Logs
 *.log
 logs/
+debug_attachments/
 
 # IDEs and Editors
 .vscode/

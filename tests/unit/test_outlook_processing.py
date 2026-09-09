@@ -226,6 +226,28 @@ def test_repository_state_does_not_skip_an_uncategorized_email():
     assert repository.get_processing_status("stable-entry-id") == second
 
 
+def test_same_subject_with_distinct_outlook_ids_is_not_treated_as_a_duplicate():
+    first = FakeItem(categories="", email_id="outlook-id-one")
+    second = FakeItem(categories="", email_id="outlook-id-two")
+    second.Subject = first.Subject
+    calls: list[str] = []
+
+    def extractor(email, **kwargs):
+        calls.append(email["entry_id"])
+        return result(ExtractionStatus.VALID)
+
+    scanner = OutlookEmailScanner(
+        config=OutlookScanConfig(dry_run=True, max_emails=2),
+        extractor=extractor,
+    )
+
+    summaries = scanner.scan(FakeOutlook(FakeFolder([first, second])))
+
+    assert [summary.email_id for summary in summaries] == ["outlook-id-one", "outlook-id-two"]
+    assert all(not summary.skipped for summary in summaries)
+    assert calls == ["outlook-id-one", "outlook-id-two"]
+
+
 def test_batam_email_is_not_a_candidate_or_history_row_and_is_not_modified(tmp_path: Path):
     item = FakeItem(subject="RE: STO DEVICE ALOKASI BATAM Asia Brand WK36 2026", categories="Blue Category")
     calls: list[str] = []

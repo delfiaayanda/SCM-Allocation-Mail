@@ -6,15 +6,15 @@ from typing import Any, Optional
 
 from scm_allocation.models.allocation import AllocationRecord, ExtractionStatus
 from scm_allocation.models.reference import AllocationContext
-from scm_allocation.normalization import normalize_material_code, normalize_quantity, normalize_text
+from scm_allocation.normalization import normalize_material_code, normalize_quantity, normalize_text, resolve_storage_locations
 
 
 def infer_allocation_context(*values: Any) -> AllocationContext:
     """Infer context only from unambiguous product/category text."""
     text = " ".join(filter(None, (normalize_text(value) for value in values))).casefold()
-    if any(term in text for term in ("logitech", "belkin", "charger", "cable", "case", "accessor")):
+    if any(term in text for term in ("logitech", "belkin", "charger", "cable", "case", "accessor", "powerbank", "earphone", "headphone", "speaker", "tripod", "microphone")):
         return AllocationContext.ACCESSORIES
-    if any(term in text for term in ("iphone", "ipad", "macbook", "mba ", "mac ")):
+    if any(term in text for term in ("iphone", "ipad", "macbook", "mba ", "mac ", "samsung galaxy", "smartphone", "laptop", "notebook", "tablet")):
         return AllocationContext.DEVICE
     return AllocationContext.UNKNOWN
 
@@ -37,6 +37,8 @@ def make_record(
     parser_type: str,
     confidence: float,
     extra_errors: tuple[str, ...] = (),
+    issuing_warehouse_sloc: Any = None,
+    destination_sloc: Any = None,
 ) -> AllocationRecord:
     normalized_material = normalize_material_code(material_code)
     normalized_description = normalize_text(material_description)
@@ -45,6 +47,13 @@ def make_record(
     normalized_plant_description = normalize_text(destination_plant_description)
     normalized_warehouse = normalize_text(issuing_warehouse_code)
     normalized_warehouse_description = normalize_text(issuing_warehouse_description)
+    resolved_issuing_sloc, resolved_destination_sloc = resolve_storage_locations(
+        issuing_warehouse_code=normalized_warehouse,
+        allocation_context=allocation_context,
+        explicit_issuing_sloc=issuing_warehouse_sloc,
+        explicit_destination_sloc=destination_sloc,
+        destination_plant_code=normalized_plant,
+    )
 
     errors = list(extra_errors)
     if normalized_material is None:
@@ -76,4 +85,6 @@ def make_record(
         extraction_status=status,
         extraction_confidence=max(0.0, min(1.0, confidence if not errors else confidence - 0.2)),
         errors=tuple(errors),
+        issuing_warehouse_sloc=resolved_issuing_sloc,
+        destination_sloc=resolved_destination_sloc,
     )

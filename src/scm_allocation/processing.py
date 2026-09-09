@@ -11,7 +11,7 @@ import sys
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from scm_allocation.extraction import OUT_OF_SCOPE_BATAM_SUBJECT, extract_email, is_out_of_scope_email
+from scm_allocation.extraction import OUT_OF_SCOPE_BATAM_SUBJECT, extract_email, is_allocation_attachment_filename, is_out_of_scope_email
 from scm_allocation.ingestion.category_writer import CategoryWriteResult, OutlookCategoryWriter
 from scm_allocation.ingestion.inspector import get_sender_address, inspect_email_item
 from scm_allocation.models.allocation import ExtractionResult, ExtractionStatus
@@ -253,7 +253,7 @@ class OutlookEmailScanner:
                 self.last_review_count += 1
             else:
                 self.last_invalid_or_excluded_count += 1
-                self.last_error_count += bool(summary.error_information)
+                self.last_error_count += 0
             if summary.category:
                 pending_writes.append((item, summary))
 
@@ -387,7 +387,7 @@ class OutlookEmailScanner:
         excel_attachments = [
             attachment
             for attachment in getattr(item, "Attachments", [])
-            if str(getattr(attachment, "FileName", "")).casefold().endswith(".xlsx")
+            if is_allocation_attachment_filename(getattr(attachment, "FileName", ""))
         ]
         if not excel_attachments:
             return self.extractor(inspected)

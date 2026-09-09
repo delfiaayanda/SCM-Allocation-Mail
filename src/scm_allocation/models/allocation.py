@@ -41,6 +41,8 @@ class AllocationRecord:
     extraction_confidence: float
     errors: tuple[str, ...] = field(default_factory=tuple)
     source_sheet: Optional[str] = None
+    issuing_warehouse_sloc: Optional[str] = None
+    destination_sloc: Optional[str] = None
 
 
 @dataclass

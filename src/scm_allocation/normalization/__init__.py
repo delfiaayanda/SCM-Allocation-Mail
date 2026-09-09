@@ -9,6 +9,7 @@ from scm_allocation.normalization.fields import (
 	normalize_quantity,
 	normalize_text,
 )
+from scm_allocation.normalization.storage_locations import resolve_storage_locations
 
 __all__ = [
 	"FIELD_ALIASES",
@@ -18,4 +19,5 @@ __all__ = [
 	"normalize_material_code",
 	"normalize_quantity",
 	"normalize_text",
+	"resolve_storage_locations",
 ]
