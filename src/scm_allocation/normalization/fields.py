@@ -147,6 +147,62 @@ def normalize_quantity(value: Any) -> Optional[Decimal]:
     return quantity if quantity >= 0 else None
 
 
+def match_semantic_field(header: Any) -> Optional[str]:
+    text = normalize_text(header)
+    if text is None:
+        return None
+
+    canonical = canonical_field_name(text)
+    if canonical:
+        return canonical
+
+    normalized = re.sub(r"[^\w\s]", " ", text.casefold())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    words = set(normalized.split())
+
+    has_word = lambda *terms: any(bool(re.search(rf"\b{re.escape(term)}\b", normalized)) for term in terms)
+
+    is_source = has_word("from", "asal", "source", "issuing", "supplying", "sender", "origin")
+
+    # 1. Quantity
+    if has_word("quantity", "qty", "alokasi", "allocation", "request", "requested", "allocated", "units", "jumlah", "vol", "volume", "pcs", "count"):
+        if not has_word("date", "time", "status", "by", "user", "type", "code", "id", "no", "number"):
+            return "quantity"
+
+    # 2. Material / SKU / Product Code
+    if not is_source and has_word("sku", "material", "article", "product", "item", "barang", "part"):
+        if not has_word("desc", "description", "deskripsi", "nama", "name", "spec", "type", "details"):
+            if (
+                has_word("code", "number", "no", "num", "id", "sap", "cd", "sku")
+                or "sku" in words
+                or "material" in words
+                or "article" in words
+                or "item" in words
+                or "product" in words
+            ):
+                return "material_code"
+
+    # 3. Material / Item Description
+    if has_word("desc", "description", "deskripsi", "nama", "name", "spec", "label") and has_word("material", "article", "item", "product", "sku", "barang", "brand", "row"):
+        return "material_description"
+
+    # 4. Destination Plant / Store / Site Code
+    if not is_source and has_word("store", "site", "plant", "outlet", "location", "destinasi", "destination", "branch", "toko", "pos"):
+        if not has_word("desc", "description", "deskripsi", "nama", "name"):
+            return "destination_plant_code"
+
+    # 5. Destination Plant / Store / Site Description
+    if not is_source and has_word("store", "site", "plant", "outlet", "location", "destinasi", "destination", "branch", "toko") and has_word("desc", "description", "deskripsi", "nama", "name"):
+        return "destination_plant_description"
+
+    # 6. Issuing Warehouse Code
+    if is_source and has_word("site", "plant", "store", "warehouse", "gudang", "wh", "code", "id"):
+        if not has_word("desc", "description", "deskripsi", "nama", "name"):
+            return "issuing_warehouse_code"
+
+    return None
+
+
 def canonical_field_name(value: Any) -> Optional[str]:
     normalized = normalize_text(value)
 
@@ -168,13 +224,17 @@ def find_alias_index(
 ) -> Optional[int]:
     aliases = {
         alias.casefold()
-        for alias in FIELD_ALIASES[field_name]
+        for alias in FIELD_ALIASES.get(field_name, ())
     }
 
     for index, header in enumerate(headers):
         normalized = normalize_text(header)
 
         if normalized and normalized.casefold() in aliases:
+            return index
+
+    for index, header in enumerate(headers):
+        if match_semantic_field(header) == field_name:
             return index
 
     return None

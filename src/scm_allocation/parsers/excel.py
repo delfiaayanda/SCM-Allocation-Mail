@@ -41,7 +41,6 @@ def _find_simple_header(ws: Any) -> Optional[int]:
         headers = _headers(ws, row_number)
         if (
             find_alias_index(headers, "material_code") is not None
-            and find_alias_index(headers, "material_description") is not None
             and find_alias_index(headers, "quantity") is not None
         ):
             return row_number
@@ -92,32 +91,34 @@ def _compound_columns(ws: Any, header_row: int) -> Optional[dict[str, int]]:
 def _simple_columns(ws: Any, header_row: int) -> Optional[dict[str, Optional[int]]]:
     headers = _headers(ws, header_row)
     material_index = find_alias_index(headers, "material_code")
-    description_index = find_alias_index(headers, "material_description")
     quantity_index = find_alias_index(headers, "quantity")
-    if material_index is None or description_index is None or quantity_index is None:
+    if material_index is None or quantity_index is None:
         return None
 
-    marker_headers = {value.casefold() for value in headers if value}
-    has_allocation_marker = bool(
-        {"request", "site code", "site desc", "from", "wh code", "warehouse code", "store code", "store name", "plant code", "code store", "destinasi code", "alokasi", "qty", "quantity"} & marker_headers
-        or any(value and (value.casefold().startswith("gudang") or value.casefold().startswith("ur ") or value.casefold().startswith("store")) for value in headers)
-    )
-    if not has_allocation_marker:
-        return None
-
+    description_index = find_alias_index(headers, "material_description")
     destination_code = find_alias_index(headers, "destination_plant_code")
     destination_description = find_alias_index(headers, "destination_plant_description")
     issuing_code = find_alias_index(headers, "issuing_warehouse_code")
     issuing_description = find_alias_index(headers, "issuing_warehouse_description")
+
+    marker_headers = {value.casefold() for value in headers if value}
+    has_allocation_marker = bool(
+        destination_code is not None
+        or {"request", "site code", "site desc", "from", "wh code", "warehouse code", "store code", "store name", "plant code", "code store", "destinasi code", "alokasi", "qty", "quantity"} & marker_headers
+        or any(value and (value.casefold().startswith("gudang") or value.casefold().startswith("ur ") or value.casefold().startswith("store") or value.casefold().startswith("outlet") or value.casefold().startswith("location")) for value in headers)
+    )
+    if not has_allocation_marker:
+        return None
+
     if destination_code is None:
         destination_code = next(
-            (index for index, value in enumerate(headers) if value and value.casefold() == "wh code"),
+            (index for index, value in enumerate(headers) if value and value.casefold() in {"wh code", "store code", "plant code", "outlet id", "location"}),
             None,
         )
     if destination_description is None:
-        destination_description = _find_text_index(headers, "bu desc", "plant desc", "ur ")
+        destination_description = _find_text_index(headers, "bu desc", "plant desc", "ur ", "store name", "outlet name")
     if issuing_code is None:
-        issuing_code = _find_text_index(headers, "from site code", "from", "warehouse code")
+        issuing_code = _find_text_index(headers, "from site code", "from", "warehouse code", "plant asal")
     if issuing_description is None:
         issuing_description = _find_text_index(headers, "from site desc", "gudang")
 

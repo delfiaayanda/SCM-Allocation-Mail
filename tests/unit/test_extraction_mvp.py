@@ -648,3 +648,42 @@ def test_excel_store_item_header_multi_block_and_scientific_notation(tmp_path: P
     assert result.records[2].destination_plant_code == "X007"
     assert result.records[2].material_code == "8100294902"
     assert result.records[2].quantity == 5
+
+
+@pytest.mark.parametrize(
+    ("store_header", "item_header", "qty_header"),
+    [
+        ("Outlet ID", "Product Number", "Requested Units"),
+        ("Location", "SKU No.", "Allocated Qty"),
+        ("Site Code", "Material Code", "Final Allocation QTY"),
+    ],
+)
+def test_semantic_header_matching_variations(tmp_path: Path, store_header: str, item_header: str, qty_header: str):
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.append([store_header, item_header, qty_header])
+    worksheet.append(["X099", "8100999001", 12])
+    path = tmp_path / f"semantic_{store_header.replace(' ', '_')}.xlsx"
+    workbook.save(path)
+
+    result = parse_excel(path)
+
+    assert result.status is ExtractionStatus.VALID
+    assert len(result.records) == 1
+    assert result.records[0].destination_plant_code == "X099"
+    assert result.records[0].material_code == "8100999001"
+    assert result.records[0].quantity == 12
+
+
+def test_unrelated_non_allocation_columns_are_not_accepted(tmp_path: Path):
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.append(["Employee Name", "Department", "Salary", "Joining Date"])
+    worksheet.append(["John Doe", "Logistics", 5000, "2025-01-01"])
+    path = tmp_path / "hr_data.xlsx"
+    workbook.save(path)
+
+    result = parse_excel(path)
+
+    assert result.status is ExtractionStatus.INVALID
+    assert result.records == []
