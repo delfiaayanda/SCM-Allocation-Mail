@@ -18,6 +18,11 @@ def main() -> int:
         action="store_true",
         help="Enable SCM Bot category writes; omitted means dry-run",
     )
+    parser.add_argument(
+        "--preview-records",
+        action="store_true",
+        help="Show a preview of extracted AllocationRecord data after the scan summary",
+    )
     args = parser.parse_args()
 
     dry_run = not args.write_categories
@@ -49,17 +54,21 @@ def main() -> int:
             print(f"[SCM] AUDIT ERROR: {audit_err}", flush=True)
         print(f"[SCM] ERROR: {err}", flush=True)
         return 1
+
     counters = scanner.run_counters()
     history_logger.record_run(args.folder, counters, dry_run)
+
     print(
         f"[SCM] Scan complete: inspected={scanner.last_scan_inspected}, "
         f"candidates={scanner.last_scan_candidates}.",
         flush=True,
     )
+
     for summary in summaries:
         details = summary.error_information or summary.review_information
         detail_text = f" | details={' ; '.join(details)}" if details else ""
         status = "SKIPPED_ALREADY_PROCESSED" if summary.skipped else summary.extraction_status.value.upper()
+
         print(
             f"Subject: {summary.subject} | Email ID: {summary.email_id} | Status: {status} | "
             f"Parser: {summary.parser_type} | records={summary.record_count} | "
@@ -67,6 +76,7 @@ def main() -> int:
             f"{detail_text}",
             flush=True,
         )
+
         for diagnostic in summary.metadata.get("worksheet_diagnostics", []):
             workbook = diagnostic.get("workbook", "<unknown workbook>")
             sheet = diagnostic.get("sheet", "<unknown>")
@@ -74,9 +84,19 @@ def main() -> int:
             detail = diagnostic.get("format") or diagnostic.get("reason", "")
             records = diagnostic.get("records")
             record_text = f" records={records}" if records is not None else ""
-            print(f"  workbook={workbook} sheet={sheet} -> {status}: {detail}{record_text}", flush=True)
+
+            print(
+                f"  workbook={workbook} sheet={sheet} -> {status}: {detail}{record_text}",
+                flush=True,
+            )
+
         for record in summary.metadata.get("records", []):
-            context_val = record.allocation_context.value if hasattr(record.allocation_context, "value") else str(record.allocation_context)
+            context_val = (
+                record.allocation_context.value
+                if hasattr(record.allocation_context, "value")
+                else str(record.allocation_context)
+            )
+
             print(
                 f"  -> AllocationRecord: material={record.material_code or '<none>'} ({record.material_description or ''}) "
                 f"qty={record.quantity} from={record.issuing_warehouse_code or '<none>'} (sloc={record.issuing_warehouse_sloc or '<none>'}) "
@@ -84,6 +104,7 @@ def main() -> int:
                 f"context={context_val} src={record.source_filename or ''}/{record.source_sheet or ''} row={record.source_row}",
                 flush=True,
             )
+
     print(f"Scanned: {counters['scanned_count']}", flush=True)
     print(f"Candidates: {counters['candidate_count']}", flush=True)
     print(f"Processed: {counters['processed_count']}", flush=True)
@@ -93,6 +114,44 @@ def main() -> int:
     print(f"Invalid/Excluded: {counters['invalid_or_excluded_count']}", flush=True)
     print(f"Write failures: {counters['write_failure_count']}", flush=True)
     print(f"Errors: {counters['error_count']}", flush=True)
+
+    if args.preview_records:
+        print("", flush=True)
+        print("=" * 60, flush=True)
+        print("SCRAPED DATA PREVIEW", flush=True)
+        print("=" * 60, flush=True)
+
+        for summary in summaries:
+            if summary.extraction_status.value.upper() != "VALID":
+                continue
+
+            records = summary.metadata.get("records", [])
+            if not records:
+                continue
+
+            print("", flush=True)
+            print(f"Email: {summary.subject}", flush=True)
+            print(f"Parser: {summary.parser_type}", flush=True)
+            print(f"Records: {len(records)}", flush=True)
+
+            preview_records = records[:5]
+
+            for record in preview_records:
+                print(
+                    f"  -> material={record.material_code or '<none>'} | "
+                    f"description={record.material_description or '<none>'} | "
+                    f"destination={record.destination_plant_code or '<none>'} | "
+                    f"qty={record.quantity} | "
+                    f"sloc={record.destination_sloc or '<none>'}",
+                    flush=True,
+                )
+
+            if len(records) > 5:
+                print(
+                    f"  ... showing 5 of {len(records)} records",
+                    flush=True,
+                )
+
     print(f"Dry-run: {dry_run}", flush=True)
     return 0
 
