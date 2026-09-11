@@ -48,6 +48,7 @@ FIELD_ALIASES: Mapping[str, tuple[str, ...]] = {
         "store code",
         "kode store",
         "kode toko",
+        "sap code",
     ),
     "destination_plant_description": (
         "to store site desc",
