@@ -5,10 +5,9 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from scm_allocation.models.reference import AllocationContext
-from scm_allocation.normalization.fields import normalize_text
+from scm_allocation.normalization.fields import classify_plant_code, normalize_text
 
 
-CENTRAL_SOURCE_CODES = frozenset({"BGC1", "BHC1", "BIC1", "BFC1"})
 DEVICE_SOURCE_SLOC = "1005"
 STANDARD_SLOC = "1001"
 
@@ -26,7 +25,7 @@ def resolve_storage_locations(
     destination_sloc = normalize_text(explicit_destination_sloc)
     source_code = (normalize_text(issuing_warehouse_code) or "").upper()
 
-    if source_sloc is None and source_code in CENTRAL_SOURCE_CODES:
+    if source_sloc is None and classify_plant_code(source_code) == "mdc":
         source_sloc = DEVICE_SOURCE_SLOC if allocation_context is AllocationContext.DEVICE else STANDARD_SLOC
     if destination_sloc is None and normalize_text(destination_plant_code):
         destination_sloc = STANDARD_SLOC

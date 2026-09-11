@@ -240,9 +240,43 @@ def find_alias_index(
     return None
 
 
-def looks_like_warehouse_code(value: Any) -> bool:
-    text = normalize_text(value)
+_STORE_CODE_RE = re.compile(r"[A-Z]\d{3}")
+_RDC_CODE_RE = re.compile(r"B[A-Z]\d{2}")
+_MDC_CODE_RE = re.compile(r"B[A-Z]C1")
 
-    return bool(
-        text and re.fullmatch(r"[A-Za-z]{2,5}\d{1,3}", text)
-    )
+
+def classify_plant_code(value: Any) -> Optional[str]:
+    """Kode plant 4 karakter Erajaya punya bentuk yang menentukan perannya:
+
+    - store  : 1 huruf + 3 angka         (M103, X022)
+    - rdc    : 2 huruf diawali B + 2 angka (BI03, BG04, BH43)
+    - mdc    : 2 huruf diawali B + "C1"    (BIC1, BGC1, BFC1)
+    - ticketing: 4 karakter lain yang tidak cocok tiga pola di atas —
+      alokasi lewat sistem ticketing, bukan STO plant-to-plant biasa.
+
+    Posisi karakter ke-2 membedakan store dari rdc/mdc tanpa ambigu (huruf vs
+    angka), jadi urutan pengecekan di bawah tidak penting untuk kebenarannya.
+    Return None untuk apa pun yang bukan 4 karakter — bukan ditebak sebagai
+    salah satu kategori.
+    """
+    text = normalize_text(value)
+    if text is None:
+        return None
+    code = text.upper()
+    if len(code) != 4:
+        return None
+    if _STORE_CODE_RE.fullmatch(code):
+        return "store"
+    if _RDC_CODE_RE.fullmatch(code):
+        return "rdc"
+    if _MDC_CODE_RE.fullmatch(code):
+        return "mdc"
+    if code.isalnum():
+        return "ticketing"
+    return None
+
+
+def looks_like_warehouse_code(value: Any) -> bool:
+    """True hanya untuk kode yang benar-benar bisa jadi SUMBER alokasi (RDC
+    atau MDC) — store dan ticketing bukan warehouse pengirim."""
+    return classify_plant_code(value) in ("rdc", "mdc")

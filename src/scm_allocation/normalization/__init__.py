@@ -3,6 +3,7 @@
 from scm_allocation.normalization.fields import (
 	FIELD_ALIASES,
 	canonical_field_name,
+	classify_plant_code,
 	find_alias_index,
 	looks_like_warehouse_code,
 	normalize_material_code,
@@ -14,6 +15,7 @@ from scm_allocation.normalization.storage_locations import resolve_storage_locat
 __all__ = [
 	"FIELD_ALIASES",
 	"canonical_field_name",
+	"classify_plant_code",
 	"find_alias_index",
 	"looks_like_warehouse_code",
 	"normalize_material_code",
