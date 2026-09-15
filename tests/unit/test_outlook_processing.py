@@ -74,8 +74,12 @@ class FakeCategories:
     def Count(self):
         return len(self.values)
 
-    def __getitem__(self, index):
+    def Item(self, index):
         return self.values[index - 1]
+
+    def __getitem__(self, index):
+        # Meniru pywin32: __getitem__ 0-based, beda dengan Item() COM 1-based.
+        return self.values[index]
 
     def Add(self, name):
         self.Add_calls.append(name)
@@ -94,10 +98,16 @@ class FakeItems:
     def Sort(self, field: str, descending: bool) -> None:
         self.sorted = True
 
-    def __getitem__(self, index: int) -> FakeItem:
+    def Item(self, index: int) -> FakeItem:
         if index in self.error_indices:
             raise RuntimeError("Outlook item is unavailable")
         return self._items[index - 1]
+
+    def __getitem__(self, index: int) -> FakeItem:
+        # Meniru pywin32: __getitem__ 0-based (lewat enumerator), beda dengan
+        # Item() COM 1-based. Fake lama 1-based di sini menutupi bug off-by-one
+        # yang di produksi melewatkan email terbaru tiap run.
+        return self._items[index]
 
 
 class FakeFolder:
@@ -272,6 +282,20 @@ def test_candidate_filter_is_conservative_and_configurable():
     non_candidate.HTMLBody = "<html><body>Routine status update.</body></html>"
     assert CandidateFilter().matches(non_candidate) is False
     assert CandidateFilter(sender_domains=(), keywords=("announcement",)).matches(non_candidate) is True
+
+
+def test_scan_includes_newest_item_and_does_not_overrun_collection():
+    newest = FakeItem(categories="", email_id="newest")
+    older = FakeItem(categories="", email_id="older")
+
+    scanner = OutlookEmailScanner(
+        config=OutlookScanConfig(dry_run=True),
+        extractor=lambda email, **kwargs: result(ExtractionStatus.VALID),
+    )
+    summaries = scanner.scan(FakeOutlook(FakeFolder([newest, older])))
+
+    assert [summary.email_id for summary in summaries] == ["newest", "older"]
+    assert scanner.last_error_count == 0
 
 
 def test_add_category_handles_empty_and_existing_delimiters():

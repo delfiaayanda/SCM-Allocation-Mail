@@ -46,7 +46,7 @@ def collect_attachments(
     fetch_count = min(max_emails, total_count)
 
     for i in range(1, fetch_count + 1):
-        item = items[i]
+        item = items.Item(i)  # 1-based COM, bukan __getitem__ 0-based pywin32
         unread_before = getattr(item, "UnRead", None)
 
         subject = getattr(item, "Subject", "<No Subject>")

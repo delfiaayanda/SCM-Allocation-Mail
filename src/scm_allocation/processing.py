@@ -220,7 +220,10 @@ class OutlookEmailScanner:
         for index in range(1, fetch_count + 1):
             self.last_scan_inspected += 1
             try:
-                item = items[index]
+                # .Item() = COM 1-based, sesuai range() di atas. JANGAN items[index]:
+                # __getitem__ pywin32 0-based, jadi email terbaru (posisi 0)
+                # terlewat dan index terakhir meledak "list index out of range".
+                item = items.Item(index)
             except Exception as err:
                 self.last_error_count += 1
                 self._report_progress(f"ERROR retrieving Outlook item {index}: {err}")
@@ -342,7 +345,7 @@ class OutlookEmailScanner:
             return namespace.GetDefaultFolder(6)
         folders = namespace.Folders
         for index in range(1, int(getattr(folders, "Count", 0)) + 1):
-            folder = folders[index]
+            folder = folders.Item(index)  # 1-based COM, bukan __getitem__ 0-based pywin32
             if normalize_text(getattr(folder, "Name", "")).casefold() == self.config.folder_name.casefold():
                 return folder
         raise RuntimeError(f"Outlook folder not found: {self.config.folder_name}")

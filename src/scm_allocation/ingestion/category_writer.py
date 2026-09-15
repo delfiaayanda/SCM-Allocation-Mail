@@ -28,7 +28,7 @@ class OutlookCategoryWriter:
         """Reuse an existing category or create it once."""
         for index in range(1, int(getattr(self.categories, "Count", 0)) + 1):
             try:
-                category = self.categories[index]
+                category = self.categories.Item(index)  # 1-based COM, bukan __getitem__ 0-based pywin32
             except (IndexError, KeyError):
                 break
             if str(getattr(category, "Name", "")).casefold() == name.casefold():

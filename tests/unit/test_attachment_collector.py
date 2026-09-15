@@ -34,7 +34,7 @@ def test_collect_attachments_mocked(tmp_path: Path, monkeypatch):
     # Mock Items collection
     mock_items = MagicMock()
     mock_items.Count = 1
-    mock_items.__getitem__.return_value = mock_item
+    mock_items.Item.return_value = mock_item
 
     mock_inbox = MagicMock()
     mock_inbox.Items = mock_items
