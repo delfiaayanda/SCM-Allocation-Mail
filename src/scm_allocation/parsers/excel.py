@@ -299,6 +299,30 @@ def _new_store_destination_names(workbook: Any) -> dict[str, str]:
     return names
 
 
+def _trim_phantom_cells(workbook: Any) -> None:
+    """Buang sel TANPA nilai di luar area yang benar-benar berisi.
+
+    Sheet yang pernah diformat sampai bawah (mis. "Alokasi Tecno 12 Oct'26.xlsx",
+    12 Okt 2026: max_row 1.048.213, baris berisi terakhir 181) membuat semua loop
+    `range(..., ws.max_row + 1)` berjalan sejuta kali; tiap putaran `_row_values`
+    membuat sel baru lalu `ws.max_column` menelusuri semua sel → kuadratik, scan
+    tidak pernah selesai dan proses menumpuk tiap jam. Dengan sel kosong di ujung
+    dibuang, max_row/max_column = ukuran data nyata dan loop lama tetap benar.
+    `_cells` = penyimpanan sel openpyxl (bukan API publik, tapi stabil); hanya
+    sel bernilai None yang dihapus, jadi tidak ada data yang hilang.
+    """
+    for ws in workbook.worksheets:
+        cells = getattr(ws, "_cells", None)
+        if not cells:
+            continue
+        filled = [key for key, cell in cells.items() if cell.value is not None]
+        last_row = max((r for r, _ in filled), default=0)
+        last_col = max((c for _, c in filled), default=0)
+        for key in [k for k, cell in cells.items()
+                    if cell.value is None and (k[0] > last_row or k[1] > last_col)]:
+            del cells[key]
+
+
 def _row_values(ws: Any, row_number: int) -> list[Any]:
     return [ws.cell(row_number, column).value for column in range(1, ws.max_column + 1)]
 
@@ -426,6 +450,7 @@ def parse_excel(
         workbook = openpyxl.load_workbook(filepath, data_only=True)
     except Exception as err:
         return ExtractionResult([], ExtractionStatus.INVALID, parser_type, source_email_id, (str(err),))
+    _trim_phantom_cells(workbook)
 
     records: list[AllocationRecord] = []
     seen_records: set[tuple[object, ...]] = set()
