@@ -326,6 +326,27 @@ def _trim_phantom_cells(workbook: Any) -> None:
 
 _REFERENCE_TITLE_RE = re.compile(r"^B[A-Z][A-Z0-9]\d$|stock|stok|sales|\bdata\b|master|pvt|pivot|soh|inventory", re.IGNORECASE)
 _REQUEST_TITLE_RE = re.compile(r"req|\bpo\b|alo[ck]asi|alloc|order|\bsto\b|npi|new\s*store|kebutuhan|permintaan", re.IGNORECASE)
+_DEAD_TITLE_RE = re.compile(r"database|\bdb\b|status|\blookup\b|\bref\b|referensi|\blow\b|\bmb52\b", re.IGNORECASE)
+_MONTHS = {
+    "jan": 1, "januari": 1, "january": 1, "feb": 2, "februari": 2, "february": 2, "mar": 3, "maret": 3, "march": 3,
+    "apr": 4, "april": 4, "mei": 5, "may": 5, "jun": 6, "juni": 6, "june": 6, "jul": 7, "juli": 7, "july": 7,
+    "agu": 8, "agt": 8, "agustus": 8, "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "okt": 10, "oct": 10, "oktober": 10, "october": 10, "nov": 11, "november": 11, "des": 12, "dec": 12,
+    "desember": 12, "december": 12,
+}
+
+
+def _stale_month_title(title: str, received: Optional[str]) -> bool:
+    """Judul sheet menyebut bulan yang sudah lewat ("STO MARSHALL APRIL" di email
+    September) — sisa alokasi lama yang ikut tersimpan di workbook."""
+    match = re.match(r"\s*(\d{4})-(\d{2})", received or "")
+    if not match:
+        return False
+    current = int(match.group(2))
+    months = {_MONTHS[w] for w in re.findall(r"[a-z]+", (title or "").casefold()) if w in _MONTHS}
+    return bool(months) and not months & {current, (current - 2) % 12 + 1}
+
+
 _REFERENCE_HEADERS = {"stor. loc.", "storage location", "unrestricted", "material group", "sales stock", "base unit of measure", "mch 1"}
 
 
@@ -375,6 +396,27 @@ def _keep_current_log_sheets(records: list[AllocationRecord], workbook: Any, sub
     return kept
 
 
+def _keep_named_sheets(records: list[AllocationRecord], body_text: Optional[str],
+                       diagnostics: list[dict[str, object]]) -> list[AllocationRecord]:
+    """Isi email menunjuk sheetnya ("lihat sheet PvT_Summary", "di sheet Final"):
+    sheet lain di workbook itu (draf, "Coret", salinan "Batch 1 (2)") adalah
+    kertas kerja — dulu ikut terbaca sehingga satu alokasi muncul 3-4 kali."""
+    body = (body_text or "").casefold()
+    if "sheet" not in body:
+        return records
+    sheets = {r.source_sheet for r in records if r.source_sheet}
+    named = {
+        title for title in sheets
+        if len(title) >= 3 and re.search(r"sheet\s*[\"'(\[]?\s*" + re.escape(title.casefold()) + r"(?![\w(])", body)
+    }
+    if not named or named == sheets:
+        return records
+    for d in diagnostics:
+        if d.get("sheet") in sheets - named and d.get("records"):
+            d["status"], d["reason"] = "dropped_unnamed", "isi email menunjuk sheet lain"
+    return [r for r in records if r.source_sheet in named]
+
+
 def _freeze_dimensions(workbook: Any) -> None:
     """Bekukan max_row/max_column tiap sheet setelah _trim_phantom_cells.
 
@@ -422,16 +464,29 @@ def _site_allocation_records(
     site_code_index = next(index for index, value in enumerate(headers) if value and value.casefold() == "site code")
     site_desc_index = next(index for index, value in enumerate(headers) if value and value.casefold() == "site desc")
     quantity_index = next(index for index, value in enumerate(headers) if value and value.casefold() == "allocation")
+    # Alokasi Apple UR: kode barang ada di kolom "Article Code" — dulu tidak
+    # dibaca, jadi semua baris tanpa material (20 dari 20 email, Okt 2026).
+    material_index = next((i for i, v in enumerate(headers) if v and v.casefold() in {"article code", "article"}), None)
+    if material_index is None:
+        material_index = find_alias_index(headers, "material_code")
+    description_index = next((i for i, v in enumerate(headers) if v and v.casefold() in {"article desc", "article description"}), None)
+    if description_index is None:
+        description_index = find_alias_index(headers, "material_description")
+
+    def at(values: list[Any], index: Optional[int]) -> Any:
+        return values[index] if index is not None and index < len(values) else None
+
     records: list[AllocationRecord] = []
     for row_number in range(header_row + 1, worksheet.max_row + 1):
         values = _row_values(worksheet, row_number)
         quantity = normalize_quantity(values[quantity_index] if quantity_index < len(values) else None)
         if quantity is None or quantity == 0:
             continue
+        material = at(values, material_index)
         records.append(
             make_record(
-                material_code=None,
-                material_description=None,
+                material_code=material,
+                material_description=at(values, description_index),
                 quantity=quantity,
                 destination_plant_code=values[site_code_index] if site_code_index < len(values) else None,
                 destination_plant_description=values[site_desc_index] if site_desc_index < len(values) else None,
@@ -444,8 +499,8 @@ def _site_allocation_records(
                 source_row=row_number,
                 source_location=f"{worksheet.title}!A{row_number}",
                 parser_type="excel_site_allocation",
-                confidence=0.7,
-                extra_errors=("source has no material code or material description",),
+                confidence=0.9 if normalize_text(material) else 0.7,
+                extra_errors=() if normalize_text(material) else ("source has no material code or material description",),
             )
         )
     return records
@@ -625,6 +680,8 @@ def parse_excel(
     destination_plant_code: Optional[str] = None,
     destination_plant_description: Optional[str] = None,
     subject: Optional[str] = None,
+    body_text: Optional[str] = None,
+    received: Optional[str] = None,
 ) -> ExtractionResult:
     """Inspect every worksheet and extract records from all supported allocation sheets."""
     parser_type = "excel_compound_grid"
@@ -884,7 +941,11 @@ def parse_excel(
     # dicoba parser generik (header bebas / kode toko sebagai judul kolom).
     productive = {d["sheet"] for d in diagnostics if d.get("records")}
     generic_strength: dict[str, int] = {}
-    for worksheet in workbook.worksheets:
+    # Sheet berjudul referensi (MASTER, Stock, …) dibaca TERAKHIR: isinya sering
+    # salinan baris sheet permintaan, dan kalau dibaca duluan baris sheet
+    # permintaan terbuang sebagai duplikat lalu sheet referensinya ikut dibuang
+    # (PO STOCK Samarinda 19 Okt: yang tersisa malah dump stok 2023).
+    for worksheet in sorted(workbook.worksheets, key=lambda ws: _is_reference_sheet(ws.title, [])):
         if worksheet.title in productive or worksheet.sheet_state != "visible":
             continue
         rows = [list(row) for row in worksheet.iter_rows(max_row=min(worksheet.max_row, 20000), values_only=True)]
@@ -939,7 +1000,30 @@ def parse_excel(
                 d["status"], d["reason"] = "dropped_reference", "sheet referensi stok, bukan permintaan"
         parser_types = {r.parser_type for r in records}
 
+    # Sheet tersembunyi yang jelas data mati (PO STOCK Samarinda: "DATABASE",
+    # dump stok 2023, 11 rb baris terbaca sebagai alokasi) dibuang kalau ada
+    # sheet terlihat yang menghasilkan rekaman. TIDAK semua sheet tersembunyi:
+    # alokasi per toko sering justru di sheet yang disembunyikan PM (Samsung GO:
+    # "GAP"; iBox Pick & Win: Sheet1 berisi STO ke XE18; Lamina: alokasi ke
+    # RDC) — dicek ke STO SAP. Yang dibuang: judul data mati / bulan lama.
+    visible_count = sum(1 for r in records if r.source_sheet not in
+                        {ws.title for ws in workbook.worksheets if ws.sheet_state != "visible"})
+    hidden = {
+        ws.title for ws in workbook.worksheets
+        if ws.sheet_state != "visible" and (
+            _REFERENCE_TITLE_RE.search(ws.title) or _DEAD_TITLE_RE.search(ws.title)
+            or _stale_month_title(ws.title, received)
+        )
+    }
+    if hidden and visible_count:
+        records = [r for r in records if r.source_sheet not in hidden]
+        for d in diagnostics:
+            if d["sheet"] in hidden and d.get("records"):
+                d["status"], d["reason"] = "dropped_hidden", "sheet tersembunyi"
+        parser_types = {r.parser_type for r in records}
+
     records = _keep_current_log_sheets(records, workbook, subject, diagnostics)
+    records = _keep_named_sheets(records, body_text, diagnostics)
     parser_types = {r.parser_type for r in records} or parser_types
 
     metadata = {"worksheet_diagnostics": diagnostics}

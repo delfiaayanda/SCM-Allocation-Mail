@@ -56,6 +56,16 @@ def _plant(value: Any) -> Optional[str]:
     return text if PLANT_RE.fullmatch(text) else None
 
 
+def _plant_in_header(header: str) -> Optional[str]:
+    """Kode plant di judul kolom: utuh ("X219") atau sebagai kata ("Inden M215",
+    "Alokasi XU06", "Stock BGC1"). Satu kode saja — dua kode = ambigu."""
+    whole = _plant(header)
+    if whole:
+        return whole
+    codes = {t for t in re.split(r"[^A-Za-z0-9]+", header.upper()) if PLANT_RE.fullmatch(t) and not t.isdigit()}
+    return codes.pop() if len(codes) == 1 else None
+
+
 def _material_data(value: Any) -> bool:
     return bool(MATERIAL_DATA_RE.fullmatch(_text(value)))
 
@@ -105,6 +115,7 @@ def _qty_header_score(header: str) -> int:
     if _has(header, "alokasi", "allocation", "alocation", "alloc", "allocated") or header.casefold().startswith(("alokasi", "allocation")):
         return 10
     if _has(header, "req", "request", "reques", "requset", "requested", "permintaan", "order", "po", "kebutuhan", "fulfill", "fullfill",
+            "inden", "indent", "inent",
             "fulfillment", "tambahan", "additional", "suggest", "proposal", "refill", "replenish", "replenishment"):
         return 9
     # Pivot hasil PM ("Sum of Quantity") — sah, tapi kalah dari kolom permintaan
@@ -251,13 +262,33 @@ def _long_layout(rows: Sequence[Sequence[Any]], h: int, width: int) -> Optional[
             destination = next(c for c in rest if c != source)  # mis. STO ke RDC: tujuannya gudang
     if source is None:
         source = next((c for c in rest if c != destination and is_wh[c]), None)
+    # "BF02/BFC1 | Alokasi XU06": kolom data berisi gudang, toko tujuannya di
+    # judul kolom qty — kolom gudang itu asal, bukan tujuan.
+    qty_store = _plant_in_header(headers[quantity])
+    if (qty_store and not WAREHOUSE_RE.fullmatch(qty_store) and destination is not None
+            and is_wh.get(destination) and source is None):
+        source, destination = destination, None
     # Format blok per toko ("Material | … | E595 | BGC1 | PO", header berulang
     # tiap toko): kode toko ada di JUDUL kolom stok, qty di kolom PO/REQ.
     header_store = header_source = None
+    header_from_qty = False
     if destination is None:
         codes = {c: _plant(headers[c]) for c in range(width) if c != quantity and _plant(headers[c])}
+        # Judul kolom qty yang menyebut tokonya ("Inden M215", "Alokasi XU06"),
+        # dan judul kolom stok gudang asal ("Stock BGC1", "BF02/BFC1").
+        qty_code = _plant_in_header(headers[quantity])
+        if qty_code:
+            codes[quantity] = qty_code
+        for c in range(width):
+            if c not in codes and c not in (material, description):
+                code = _plant_in_header(headers[c])
+                if code and WAREHOUSE_RE.fullmatch(code):
+                    codes[c] = code
         stores = [code for code in codes.values() if not WAREHOUSE_RE.fullmatch(code)]
-        if len(stores) == 1:
+        if qty_code and not WAREHOUSE_RE.fullmatch(qty_code):
+            stores = [qty_code]
+            header_from_qty = True
+        if len(set(stores)) == 1:
             header_store = stores[0]
             warehouses = [code for code in codes.values() if WAREHOUSE_RE.fullmatch(code)]
             header_source = warehouses[0] if len(warehouses) == 1 else None
@@ -266,7 +297,7 @@ def _long_layout(rows: Sequence[Sequence[Any]], h: int, width: int) -> Optional[
                       and stats[c]["numeric"] < 0.5), None)
     return {"kind": "long", "header": header_row, "qty_score": best or 8, "material": material, "description": description, "quantity": quantity,
             "source": source, "destination": destination, "dest_desc": dest_desc,
-            "header_store": header_store, "header_source": header_source,
+            "header_store": header_store, "header_source": header_source, "header_from_qty": header_from_qty,
             # Kolom permintaan bernama tegas (REQ/PO/Alokasi) mengalahkan matriks
             # toko yang kebetulan punya kode toko di judul kolom stok.
             "score": (2 if material is not None else 1) + (1 if destination is not None or header_store else 0)
@@ -408,6 +439,12 @@ def extract_generic_layout(
 
     last_dest = None
     block_store, block_source = layout.get("header_store"), layout.get("header_source")
+    # Kode toko di judul kolom vs di subjek/isi email berbeda: email yang menang
+    # (Olike: judul "Alokasi N183" salah ketik, subjek & STO-nya M183).
+    email_store = _plant(destination_plant_code)
+    if (layout.get("header_from_qty") and block_store and email_store
+            and not WAREHOUSE_RE.fullmatch(email_store) and block_store != email_store):
+        block_store = email_store
     header_material = _text(cell(rows[layout["header"]], layout.get("material"))) if layout["header"] >= 0 else ""
     for i in range(layout["header"] + 1, len(rows)):
         row = rows[i]

@@ -52,7 +52,9 @@ def _push_and_categorize(summaries, *, outlook, write_categories: bool,
         # Email alokasi yang isinya tak terbaca: tetap di-push (records kosong +
         # alasan bot + potongan isi) supaya PIC mengerjakan manual — dulu dibuang.
         tak_terbaca = None if records else summary.metadata.get("tak_terbaca")
-        if not info and not tak_terbaca and (
+        # Balasan thread tanpa permintaan baru / memo: info dengan catatan bot.
+        catatan_bot = None if records else summary.metadata.get("catatan_bot")
+        if not info and not tak_terbaca and not catatan_bot and (
             not records or summary.extraction_status not in (ExtractionStatus.VALID, ExtractionStatus.PARTIAL)
         ):
             continue
@@ -61,8 +63,9 @@ def _push_and_categorize(summaries, *, outlook, write_categories: bool,
                 api_base=api_base, machine_key=machine_key, source_id=source_id,
                 email_id=summary.email_id, sender=summary.sender, subject=summary.subject,
                 records=records,
-                body_preview=summary.metadata.get("body_preview") if info or tak_terbaca else None,
+                body_preview=summary.metadata.get("body_preview") if info or tak_terbaca or catatan_bot else None,
                 tak_terbaca=tak_terbaca,
+                catatan_bot=catatan_bot,
             )
         except ApexPushError as err:
             print(f"[SCM] APEX PUSH FAILED: {summary.subject} | {err}", flush=True)

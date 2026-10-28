@@ -8,7 +8,7 @@ from typing import Optional
 from scm_allocation.models.allocation import AllocationRecord, ExtractionResult, ExtractionStatus
 from scm_allocation.normalization import find_alias_index, looks_like_warehouse_code, normalize_text
 from scm_allocation.parsers.common import infer_allocation_context, make_record
-from scm_allocation.parsers.generic import extract_generic
+from scm_allocation.parsers.generic import MATERIAL_DATA_RE, extract_generic
 
 
 class _TableParser(HTMLParser):
@@ -322,16 +322,34 @@ def parse_html(
         # Parser generik: header bebas, kode toko sebagai judul kolom, sel merge.
         # Hanya kalau parser tabel lama tidak menemukan apa pun di email ini.
         seen: set[tuple[object, ...]] = set()
-        for table_number, grid in enumerate(parse_html_tables(html, expand_spans=True), start=1):
-            for record in extract_generic(
+        grids = parse_html_tables(html, expand_spans=True)
+        # Outlook kadang memecah satu tabel jadi dua: baris judul di tabel sendiri,
+        # baris data di tabel berikutnya (lebar sama). Pasangan itu dicoba digabung
+        # lebih dulu; tabel yang sudah terbaca lewat gabungan tidak dibaca ulang.
+        candidates: list[tuple[str, list[list[str]], tuple[int, ...]]] = []
+        for i in range(len(grids) - 1):
+            head, body = grids[i], grids[i + 1]
+            if (head and body and len({len(r) for r in head + body}) == 1
+                    and not any(MATERIAL_DATA_RE.fullmatch(c.strip()) for r in head for c in r)
+                    and any(MATERIAL_DATA_RE.fullmatch(c.strip()) for r in body for c in r)):
+                candidates.append((f"table[{i + 1}+{i + 2}] ", head + body, (i, i + 1)))
+        candidates += [(f"table[{i + 1}] ", grid, (i,)) for i, grid in enumerate(grids)]
+        used: set[int] = set()
+        for prefix, grid, members in candidates:
+            if used & set(members):
+                continue
+            found = extract_generic(
                 grid,
                 source_email_id=source_email_id,
                 source_filename=None,
                 source_sheet=None,
                 destination_plant_code=destination_plant_code,
                 destination_plant_description=destination_plant_description,
-                location_prefix=f"table[{table_number}] ",
-            ):
+                location_prefix=prefix,
+            )
+            if found:
+                used |= set(members)
+            for record in found:
                 identity = (record.material_code, record.material_description, record.quantity,
                             record.destination_plant_code, record.issuing_warehouse_code)
                 if identity in seen:

@@ -108,6 +108,7 @@ def push_records_to_apex(
     records: list[AllocationRecord], timeout: float = 30.0,
     body_preview: str | None = None,
     tak_terbaca: str | None = None,
+    catatan_bot: str | None = None,
 ) -> dict:
     """POST one email's records to /api/submissions/from-outlook.
 
@@ -127,6 +128,9 @@ def push_records_to_apex(
         # tak_terbaca terisi (email alokasi yang isinya gagal diparse).
         "body_preview": body_preview,
         "tak_terbaca": tak_terbaca,
+        # Email bersubjek alokasi yang bukan permintaan baru (balasan thread,
+        # memo): records kosong, masuk APEX sebagai info dengan catatan ini.
+        "catatan_bot": catatan_bot,
     }).encode("utf-8")
 
     req = urlrequest.Request(

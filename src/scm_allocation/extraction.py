@@ -9,6 +9,7 @@ from typing import Mapping, Optional
 from scm_allocation.models.allocation import ExtractionResult, ExtractionStatus
 from scm_allocation.normalization import normalize_text
 from scm_allocation.parsers import parse_excel, parse_html
+from scm_allocation.parsers.text import parse_text_request
 
 
 OUT_OF_SCOPE_BATAM_SUBJECT = "re: sto device alokasi batam asia brand wk36 2026"
@@ -66,6 +67,18 @@ def _extract_email_plant(email: Mapping[str, object]) -> tuple[Optional[str], Op
     return None, None
 
 
+def _text_fallback(email: Mapping[str, object], source_email_id: Optional[str], failed: ExtractionResult) -> ExtractionResult:
+    """Lampiran/tabel tidak menghasilkan apa pun: coba permintaan berbentuk teks
+    ("Material : 8100… Qty : 1 unit"). Hasilnya selalu PARTIAL (dicek PIC)."""
+    plant_code, _ = _extract_email_plant(email)
+    records = parse_text_request(email.get("body_plain_text"), email.get("subject"),
+                                 source_email_id=source_email_id, destination_plant_code=plant_code)
+    if not records:
+        return failed
+    return ExtractionResult(records, ExtractionStatus.PARTIAL, "text_body", source_email_id,
+                            metadata={**failed.metadata, "fallback_from": failed.parser_type})
+
+
 def extract_email(
     email: Mapping[str, object],
     *,
@@ -113,6 +126,8 @@ def extract_email(
                 destination_plant_code=plant_code,
                 destination_plant_description=plant_description,
                 subject=normalize_text(subject),
+                body_text=str(email.get("body_plain_text") or ""),
+                received=str(email.get("received_time") or ""),
             )
         )
 
@@ -163,14 +178,14 @@ def extract_email(
                 html_result.metadata = {**html_result.metadata, "worksheet_diagnostics": diagnostics,
                                         "attachment_diagnostics": attachment_diagnostics}
                 return html_result
-        return ExtractionResult(
+        return _text_fallback(email, source_email_id, ExtractionResult(
             [],
             ExtractionStatus.INVALID,
             next(iter(parser_types)) if len(parser_types) == 1 else "excel_multi_attachment",
             source_email_id,
             tuple(errors) or ("no allocation worksheet found",),
             metadata={"worksheet_diagnostics": diagnostics, "attachment_diagnostics": attachment_diagnostics},
-        )
+        ))
 
     html_body = email.get("body_html")
     if normalize_text(html_body):
@@ -182,13 +197,13 @@ def extract_email(
             destination_plant_description=plant_description,
         )
         html_result.metadata = {**html_result.metadata, "attachment_diagnostics": attachment_diagnostics}
-        return html_result
+        return html_result if html_result.records else _text_fallback(email, source_email_id, html_result)
 
-    return ExtractionResult(
+    return _text_fallback(email, source_email_id, ExtractionResult(
         [],
         ExtractionStatus.UNSUPPORTED,
         "format_detection",
         source_email_id,
         ("email has no supported Excel attachment or HTML body",),
         metadata={"attachment_diagnostics": attachment_diagnostics},
-    )
+    ))

@@ -11,7 +11,7 @@ import sys
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from scm_allocation.allocation_subject import is_allocation_subject
+from scm_allocation.allocation_subject import NON_ALLOCATION_SUBJECT_RE, is_allocation_subject, non_request_reason
 from scm_allocation.extraction import OUT_OF_SCOPE_BATAM_SUBJECT, extract_email, is_allocation_attachment_filename, is_out_of_scope_email
 from scm_allocation.ingestion.category_writer import CategoryWriteResult, OutlookCategoryWriter
 from scm_allocation.ingestion.inspector import get_sender_address, inspect_email_item
@@ -68,6 +68,11 @@ class CandidateFilter:
         # subjek "REQUEST STOCK … NEW STORE" tanpa kata alokasi).
         if is_allocation_subject(subject, sender):
             return True
+        # Retur / cancel STO / notifikasi: dulu tetap lolos lewat kata "alokasi"
+        # di isi email dan terbaca sebagai alokasi (Request Returan Terpusat:
+        # 34 rb baris) — padahal bukan permintaan alokasi.
+        if NON_ALLOCATION_SUBJECT_RE.search(subject):
+            return False
         sender_domain = sender.rsplit("@", 1)[-1].casefold() if "@" in sender else ""
         if self.sender_domains and sender_domain not in {domain.casefold() for domain in self.sender_domains}:
             return False
@@ -438,11 +443,22 @@ class OutlookEmailScanner:
         ):
             # Email alokasi yang isinya tidak terbaca: JANGAN dibuang diam-diam —
             # kirim ke APEX dengan alasannya supaya PIC mengerjakan manual.
-            desired_category = UNREADABLE_CATEGORY
-            info_metadata = {
-                "tak_terbaca": _unreadable_reason(result, inspected),
-                "body_preview": _body_preview(item),
-            }
+            # Kecuali balasan thread tanpa permintaan baru / memo: masuk sebagai
+            # info supaya tidak mengantre jadi kerja manual.
+            has_excel = any(
+                isinstance(a, Mapping) and is_allocation_attachment_filename(a.get("filename"))
+                for a in ((inspected or {}).get("attachments") or [])
+            )
+            catatan = non_request_reason(subject, (inspected or {}).get("body_plain_text"), has_excel)
+            if catatan:
+                desired_category = INFO_CATEGORY
+                info_metadata = {"catatan_bot": catatan, "body_preview": _body_preview(item)}
+            else:
+                desired_category = UNREADABLE_CATEGORY
+                info_metadata = {
+                    "tak_terbaca": _unreadable_reason(result, inspected),
+                    "body_preview": _body_preview(item),
+                }
         elif not result.records and self.config.candidate_filter.is_wajib(sender):
             # Pengirim di daftar wajib, tapi tidak ada alokasi terbaca: tetap
             # dikirim ke APEX sebagai email info supaya masuk kotak masuk PIC-nya.
