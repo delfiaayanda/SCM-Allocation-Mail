@@ -8,46 +8,129 @@ from typing import Optional
 from scm_allocation.models.allocation import AllocationRecord, ExtractionResult, ExtractionStatus
 from scm_allocation.normalization import find_alias_index, looks_like_warehouse_code, normalize_text
 from scm_allocation.parsers.common import infer_allocation_context, make_record
+from scm_allocation.parsers.generic import extract_generic
 
 
 class _TableParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.tables: list[list[list[str]]] = []
-        self._table: Optional[list[list[str]]] = None
-        self._row: Optional[list[str]] = None
-        self._cell: Optional[list[str]] = None
+    """Kumpulkan semua <table>, termasuk yang bersarang.
 
-    def handle_starttag(self, tag: str, _attrs: list[tuple[str, Optional[str]]]) -> None:
-        del _attrs
+    Email Outlook membungkus isi dengan tabel layout; dulu tabel dalam menimpa
+    status tabel luar, jadi baris sesudahnya hilang. Sekarang tiap tabel punya
+    tumpukan sendiri.
+
+    `expand_spans=True` (dipakai parser generik): colspan direntang dan sel
+    rowspan diulang di baris bawahnya, supaya kolom data tetap sejajar header
+    (email "Permintaan Alokasi … X249": kolom toko di-merge, kolom sesudahnya
+    bergeser). Parser lama tetap menerima baris apa adanya (False).
+    """
+
+    def __init__(self, expand_spans: bool = False) -> None:
+        super().__init__(convert_charrefs=True)
+        self.expand_spans = expand_spans
+        self.tables: list[list[list[str]]] = []
+        # Tiap entri: {"rows", "row": [(teks, colspan, rowspan)] | None,
+        #              "cell": [potongan teks] | None, "span": (colspan, rowspan),
+        #              "pending": {kolom: [sisa baris, teks]}}
+        self._stack: list[dict] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         tag = tag.casefold()
         if tag == "table":
-            self._table = []
-        elif tag == "tr" and self._table is not None:
-            self._row = []
-        elif tag in {"td", "th"} and self._row is not None:
-            self._cell = []
+            self._stack.append({"rows": [], "row": None, "cell": None, "span": (1, 1), "pending": {}})
+        elif not self._stack:
+            return
+        elif tag == "tr":
+            self._close_row()
+            self._stack[-1]["row"] = []
+        elif tag in {"td", "th"}:
+            top = self._stack[-1]
+            if top["row"] is None:
+                top["row"] = []
+            self._close_cell()
+            values = dict(attrs)
+
+            def span(name: str) -> int:
+                try:
+                    return max(1, min(int(values.get(name) or 1), 50))
+                except ValueError:
+                    return 1
+            top["cell"], top["span"] = [], (span("colspan"), span("rowspan"))
+        elif tag == "br" and self._stack[-1]["cell"] is not None:
+            self._stack[-1]["cell"].append(" ")
 
     def handle_data(self, data: str) -> None:
-        if self._cell is not None:
-            self._cell.append(data)
+        if self._stack and self._stack[-1]["cell"] is not None:
+            self._stack[-1]["cell"].append(data)
+
+    def _close_cell(self) -> None:
+        top = self._stack[-1]
+        if top["cell"] is not None and top["row"] is not None:
+            top["row"].append((" ".join("".join(top["cell"]).split()), *top["span"]))
+        top["cell"] = None
+
+    def _layout(self, top: dict, cells: list[tuple[str, int, int]]) -> list[str]:
+        if not self.expand_spans:
+            return [text for text, _, _ in cells]
+        pending, out, col = top["pending"], [], 0
+
+        def take_pending() -> None:
+            nonlocal col
+            while col in pending:
+                remaining, text = pending[col]
+                out.append(text)
+                if remaining <= 1:
+                    del pending[col]
+                else:
+                    pending[col][0] = remaining - 1
+                col += 1
+        for text, colspan, rowspan in cells:
+            take_pending()
+            for k in range(colspan):
+                out.append(text if k == 0 else "")
+                if rowspan > 1:
+                    pending[col] = [rowspan - 1, text if k == 0 else ""]
+                col += 1
+        while pending and col <= max(pending):
+            if col in pending:
+                take_pending()
+            else:
+                out.append("")
+                col += 1
+        return out
+
+    def _close_row(self) -> None:
+        self._close_cell()
+        top = self._stack[-1]
+        if top["row"]:
+            row = self._layout(top, top["row"])
+            if any(value for value in row):
+                top["rows"].append(row)
+        top["row"] = None
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.casefold()
-        if tag in {"td", "th"} and self._row is not None and self._cell is not None:
-            self._row.append(" ".join("".join(self._cell).split()))
-            self._cell = None
-        elif tag == "tr" and self._table is not None and self._row:
-            self._table.append(self._row)
-            self._row = None
-        elif tag == "table" and self._table:
-            self.tables.append(self._table)
-            self._table = None
+        if not self._stack:
+            return
+        if tag in {"td", "th"}:
+            self._close_cell()
+        elif tag == "tr":
+            self._close_row()
+        elif tag == "table":
+            self._close_row()
+            rows = self._stack.pop()["rows"]
+            if rows:
+                self.tables.append(rows)
+
+    def close(self) -> None:
+        super().close()
+        while self._stack:
+            self.handle_endtag("table")
 
 
-def parse_html_tables(html: str) -> list[list[list[str]]]:
-    parser = _TableParser()
+def parse_html_tables(html: str, *, expand_spans: bool = False) -> list[list[list[str]]]:
+    parser = _TableParser(expand_spans)
     parser.feed(html or "")
+    parser.close()
     return parser.tables
 
 
@@ -161,7 +244,9 @@ def _parse_pivot_table(
         return []
 
     request_subheader_index = request_section
-    if request_subheader_index >= len(subheaders):
+    # Tabel cuma dua baris (judul + subjudul, tanpa data) dulu meledak di table[2]
+    # ("list index out of range") dan seluruh email jatuh INVALID.
+    if request_subheader_index >= len(subheaders) or len(table) < 3:
         return []
     request_data_index = len(table[2]) - len(subheaders) + request_subheader_index
     destination_plant_code = subheaders[request_subheader_index]
@@ -206,12 +291,18 @@ def parse_html(
     for table_number, table in enumerate(parser_tables, start=1):
         if not table:
             continue
+        table_records: list[AllocationRecord] = []
+        parser_type_used: Optional[str] = None
         if find_alias_index(table[0], "destination_plant_code") is not None and find_alias_index(table[0], "quantity") is not None:
             table_records = _parse_flat_table(table, source_email_id=source_email_id, table_number=table_number)
-            if table_records:
-                parser_types.add("html_flat_table")
-                records.extend(table_records)
-        elif len(table) > 1:
+            parser_type_used = "html_flat_table"
+        # A generic "plant"/"store" header can also match a SOURCE-side column
+        # (e.g. a redundant "Plant" column alongside an explicit warehouse-code
+        # header) — when that false-positive heuristic leaves _parse_flat_table
+        # with no rows (it additionally requires a plant DESCRIPTION column),
+        # fall through to the matrix/pivot shapes instead of discarding the
+        # table outright.
+        if not table_records and len(table) > 1:
             table_records = _parse_single_request_table(
                 table,
                 source_email_id=source_email_id,
@@ -219,14 +310,35 @@ def parse_html(
                 destination_plant_code=destination_plant_code,
                 destination_plant_description=destination_plant_description,
             )
-            if table_records:
-                parser_types.add("html_request_matrix")
-                records.extend(table_records)
-            else:
-                table_records = _parse_pivot_table(table, source_email_id=source_email_id, table_number=table_number)
-                if table_records:
-                    parser_types.add("html_pivot_table")
-                    records.extend(table_records)
+            parser_type_used = "html_request_matrix"
+        if not table_records and len(table) > 1:
+            table_records = _parse_pivot_table(table, source_email_id=source_email_id, table_number=table_number)
+            parser_type_used = "html_pivot_table"
+        if table_records:
+            parser_types.add(parser_type_used)
+            records.extend(table_records)
+
+    if not records:
+        # Parser generik: header bebas, kode toko sebagai judul kolom, sel merge.
+        # Hanya kalau parser tabel lama tidak menemukan apa pun di email ini.
+        seen: set[tuple[object, ...]] = set()
+        for table_number, grid in enumerate(parse_html_tables(html, expand_spans=True), start=1):
+            for record in extract_generic(
+                grid,
+                source_email_id=source_email_id,
+                source_filename=None,
+                source_sheet=None,
+                destination_plant_code=destination_plant_code,
+                destination_plant_description=destination_plant_description,
+                location_prefix=f"table[{table_number}] ",
+            ):
+                identity = (record.material_code, record.material_description, record.quantity,
+                            record.destination_plant_code, record.issuing_warehouse_code)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                records.append(record)
+                parser_types.add(record.parser_type)
 
     if not records:
         return ExtractionResult([], ExtractionStatus.INVALID, "html_table", source_email_id, ("no supported allocation table found",))

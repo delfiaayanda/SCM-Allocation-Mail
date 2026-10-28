@@ -13,6 +13,7 @@ from scm_allocation.ingestion.history import CsvProcessingLogger
 from scm_allocation.processing import (
     REVIEW_CATEGORY,
     SCRAPED_CATEGORY,
+    UNREADABLE_CATEGORY,
     CandidateFilter,
     InMemoryEmailProcessingRepository,
     OutlookEmailScanner,
@@ -171,8 +172,10 @@ def test_dry_run_does_not_write_categories_or_read_state():
     [
         (ExtractionStatus.VALID, SCRAPED_CATEGORY),
         (ExtractionStatus.PARTIAL, REVIEW_CATEGORY),
-        (ExtractionStatus.INVALID, None),
-        (ExtractionStatus.UNSUPPORTED, None),
+        # Subjek FakeItem = "Alokasi sample request": email alokasi yang tak
+        # terbaca tidak lagi dibuang, tapi dikirim ke APEX untuk dikerjakan manual.
+        (ExtractionStatus.INVALID, UNREADABLE_CATEGORY),
+        (ExtractionStatus.UNSUPPORTED, UNREADABLE_CATEGORY),
     ],
 )
 def test_write_mode_assigns_category_and_preserves_unread_state(status, expected_category):
@@ -282,6 +285,62 @@ def test_candidate_filter_is_conservative_and_configurable():
     non_candidate.HTMLBody = "<html><body>Routine status update.</body></html>"
     assert CandidateFilter().matches(non_candidate) is False
     assert CandidateFilter(sender_domains=(), keywords=("announcement",)).matches(non_candidate) is True
+
+
+class RaisingBodyItem:
+    """Mimics Outlook item types (meeting requests, read receipts, sharing
+    invites) that raise a COM 'Not implemented' error reading Body/HTMLBody
+    instead of returning "" — getattr's default only masks AttributeError,
+    not COM errors raised from the property getter itself."""
+
+    def __init__(self, subject: str) -> None:
+        self.Subject = subject
+        self.SenderEmailType = "SMTP"
+        self.SenderEmailAddress = "pm@erajaya.com"
+        self.SenderName = "PM"
+
+    @property
+    def Body(self):
+        raise OSError("(-2147352567, 'Exception occurred.', (4096, 'Microsoft Outlook', "
+                       "'Not implemented.', None, 0, -2147467263), None)")
+
+    @property
+    def HTMLBody(self):
+        raise OSError("Not implemented")
+
+
+def test_candidate_filter_treats_unreadable_body_as_no_match_instead_of_crashing():
+    item = RaisingBodyItem(subject="Meeting request: weekly sync")
+    assert CandidateFilter().matches(item) is False
+
+
+def test_candidate_filter_still_matches_via_subject_when_body_is_unreadable():
+    item = RaisingBodyItem(subject="Request Alokasi sample")
+    assert CandidateFilter().matches(item) is True
+
+
+def test_unreadable_body_item_does_not_abort_scan_of_later_items():
+    unreadable = RaisingBodyItem(subject="Meeting request: weekly sync")
+    unreadable.EntryID = "unreadable-entry"
+    unreadable.ReceivedTime = "2026-09-13 08:00:00+00:00"
+    unreadable.UnRead = True
+    unreadable.Categories = ""
+    unreadable.Attachments = []
+    unreadable.Application = None
+
+    candidate = FakeItem(categories="", email_id="candidate-after")
+
+    scanner = OutlookEmailScanner(
+        config=OutlookScanConfig(dry_run=True),
+        extractor=lambda email, **kwargs: result(ExtractionStatus.VALID),
+    )
+    outlook = FakeOutlook(FakeFolder([unreadable, candidate]))
+
+    summaries = scanner.scan(outlook)
+
+    assert scanner.last_scan_inspected == 2
+    assert scanner.last_scan_candidates == 1
+    assert [summary.email_id for summary in summaries] == ["candidate-after"]
 
 
 def test_scan_includes_newest_item_and_does_not_overrun_collection():
@@ -502,7 +561,9 @@ def test_history_and_run_rows_share_one_run_id(tmp_path: Path):
 
 
 def test_processing_summary_keeps_error_details():
-    item = FakeItem()
+    # Subjek bukan alokasi (kandidat hanya karena kata "alokasi" di isi email):
+    # hasil INVALID tetap tanpa kategori, seperti dulu.
+    item = FakeItem(subject="Weekly update tim SCM")
     scanner, outlook = scanner_for(item, result(ExtractionStatus.INVALID), dry_run=True)
 
     summary = scanner.scan(outlook)[0]

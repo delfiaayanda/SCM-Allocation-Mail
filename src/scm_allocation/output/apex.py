@@ -67,10 +67,47 @@ def record_to_dict(record: AllocationRecord) -> dict[str, Any]:
     }
 
 
+def fetch_pengirim_wajib(*, api_base: str, machine_key: str, cache_path: str,
+                         timeout: float = 15.0) -> tuple[frozenset[str], str]:
+    """Daftar email pengirim WAJIB (sheet MNP/CM -> PIC RICO di APEX) —
+    email mereka diambil walau tidak berbau alokasi.
+
+    Berhasil -> disimpan ke `cache_path`. Gagal (APEX mati, key salah) -> pakai
+    cache terakhir; tanpa cache -> daftar kosong (perilaku lama: hanya email
+    berbau alokasi). Return (daftar, keterangan sumber untuk log).
+    """
+    try:
+        if not api_base or not machine_key:
+            raise ApexPushError("APEX_API_BASE / APEX_MACHINE_KEY belum di-set")
+        req = urlrequest.Request(
+            url=f"{api_base.rstrip('/')}/api/submissions/pengirim-wajib",
+            method="GET", headers={"x-machine-key": machine_key},
+        )
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            emails = json.loads(resp.read().decode("utf-8")).get("emails") or []
+        daftar = frozenset(str(e).strip().casefold() for e in emails if str(e).strip())
+        try:
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(sorted(daftar), f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+        return daftar, f"APEX ({len(daftar)} email)"
+    except (ApexPushError, HTTPError, URLError, OSError, ValueError) as err:
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                daftar = frozenset(str(e).strip().casefold() for e in json.load(f) if str(e).strip())
+            return daftar, f"cache {cache_path} ({len(daftar)} email; APEX gagal: {err})"
+        except (OSError, ValueError):
+            return frozenset(), f"kosong (APEX gagal: {err}; belum ada cache)"
+
+
 def push_records_to_apex(
     *, api_base: str, machine_key: str, source_id: int,
     email_id: str, sender: str | None, subject: str | None,
     records: list[AllocationRecord], timeout: float = 30.0,
+    body_preview: str | None = None,
+    tak_terbaca: str | None = None,
 ) -> dict:
     """POST one email's records to /api/submissions/from-outlook.
 
@@ -85,6 +122,11 @@ def push_records_to_apex(
         "sender":    sender,
         "subject":   subject,
         "records":   [record_to_dict(r) for r in records],
+        # records kosong + body_preview = email info dari pengirim di daftar
+        # wajib; APEX menolak records kosong dari pengirim lain — kecuali
+        # tak_terbaca terisi (email alokasi yang isinya gagal diparse).
+        "body_preview": body_preview,
+        "tak_terbaca": tak_terbaca,
     }).encode("utf-8")
 
     req = urlrequest.Request(

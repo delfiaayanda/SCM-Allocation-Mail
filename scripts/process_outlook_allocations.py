@@ -10,8 +10,8 @@ from pathlib import Path
 from scm_allocation.ingestion.category_writer import OutlookCategoryWriter
 from scm_allocation.ingestion.history import CsvProcessingLogger
 from scm_allocation.models.allocation import ExtractionStatus
-from scm_allocation.output.apex import ApexPushError, load_env_file, push_records_to_apex
-from scm_allocation.processing import OutlookEmailScanner, OutlookScanConfig
+from scm_allocation.output.apex import ApexPushError, fetch_pengirim_wajib, load_env_file, push_records_to_apex
+from scm_allocation.processing import CandidateFilter, OutlookEmailScanner, OutlookScanConfig
 
 
 def _push_and_categorize(summaries, *, outlook, write_categories: bool,
@@ -46,13 +46,23 @@ def _push_and_categorize(summaries, *, outlook, write_categories: bool,
 
     for summary in summaries:
         records = summary.metadata.get("records", [])
-        if not records or summary.extraction_status not in (ExtractionStatus.VALID, ExtractionStatus.PARTIAL):
+        # Email info: pengirim di daftar wajib APEX tanpa alokasi terbaca — tetap
+        # di-push (records kosong + potongan isi) supaya masuk kotak masuk PIC-nya.
+        info = bool(summary.metadata.get("wajib")) and not records
+        # Email alokasi yang isinya tak terbaca: tetap di-push (records kosong +
+        # alasan bot + potongan isi) supaya PIC mengerjakan manual — dulu dibuang.
+        tak_terbaca = None if records else summary.metadata.get("tak_terbaca")
+        if not info and not tak_terbaca and (
+            not records or summary.extraction_status not in (ExtractionStatus.VALID, ExtractionStatus.PARTIAL)
+        ):
             continue
         try:
             result = push_records_to_apex(
                 api_base=api_base, machine_key=machine_key, source_id=source_id,
                 email_id=summary.email_id, sender=summary.sender, subject=summary.subject,
                 records=records,
+                body_preview=summary.metadata.get("body_preview") if info or tak_terbaca else None,
+                tak_terbaca=tak_terbaca,
             )
         except ApexPushError as err:
             print(f"[SCM] APEX PUSH FAILED: {summary.subject} | {err}", flush=True)
@@ -82,6 +92,14 @@ def _push_and_categorize(summaries, *, outlook, write_categories: bool,
 
 
 def main() -> int:
+    # stdout ke pipe (main-server) / file memakai cp1252 di Windows: judul sheet
+    # atau subjek ber-emoji ("📋") dulu membuat print() crash SEBELUM tahap push,
+    # jadi seluruh run tidak mengirim apa pun (28 Okt 2026). main-server membaca UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser(description="Scan Outlook allocation emails safely.")
     parser.add_argument("--folder", default="Inbox", help="Outlook folder name; default: Inbox")
     parser.add_argument("--max-emails", type=int, default=None, help="Maximum newest items to inspect; omitted scans the full folder")
@@ -117,10 +135,19 @@ def main() -> int:
         flush=True,
     )
     print("[SCM] Connecting to Outlook...", flush=True)
+    # Pengirim di daftar wajib APEX (sheet MNP/CM -> PIC RICO) diambil walau
+    # emailnya tidak berbau alokasi; gagal ambil -> cache terakhir.
+    wajib, sumber_wajib = fetch_pengirim_wajib(
+        api_base=os.getenv("APEX_API_BASE", "").strip(),
+        machine_key=os.getenv("APEX_MACHINE_KEY", "").strip(),
+        cache_path=str(Path(__file__).resolve().parent.parent / "data" / "pengirim_wajib.json"),
+    )
+    print(f"[SCM] Daftar pengirim wajib: {sumber_wajib}", flush=True)
     config = OutlookScanConfig(
         folder_name=args.folder,
         max_emails=args.max_emails,
         dry_run=scan_dry_run,
+        candidate_filter=CandidateFilter(wajib_senders=wajib),
     )
     history_logger = CsvProcessingLogger(Path("logs"))
     scanner = OutlookEmailScanner(

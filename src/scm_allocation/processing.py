@@ -11,6 +11,7 @@ import sys
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Dict, Mapping, Optional
 
+from scm_allocation.allocation_subject import is_allocation_subject
 from scm_allocation.extraction import OUT_OF_SCOPE_BATAM_SUBJECT, extract_email, is_allocation_attachment_filename, is_out_of_scope_email
 from scm_allocation.ingestion.category_writer import CategoryWriteResult, OutlookCategoryWriter
 from scm_allocation.ingestion.inspector import get_sender_address, inspect_email_item
@@ -21,6 +22,15 @@ from scm_allocation.processing_categories import add_category_text, category_par
 
 SCRAPED_CATEGORY = "SCM Bot - Scraped"
 REVIEW_CATEGORY = "SCM Bot - Review"
+# Email dari pengirim di daftar wajib APEX (sheet MNP/CM -> PIC RICO) yang tidak
+# berisi alokasi terbaca: tetap di-push ke APEX sebagai email info (isi ringkas).
+INFO_CATEGORY = "SCM Bot - Info"
+# Email ALOKASI (dari subjek, lihat allocation_subject.py) yang isinya tidak bisa
+# diparse: tetap di-push ke APEX sebagai jenis 'tak_terbaca' untuk dikerjakan
+# manual, lalu diberi kategori ini supaya tidak diproses ulang tiap jam.
+UNREADABLE_CATEGORY = "SCM Bot - Tak Terbaca"
+BOT_CATEGORIES = (SCRAPED_CATEGORY, REVIEW_CATEGORY, INFO_CATEGORY, UNREADABLE_CATEGORY)
+BODY_PREVIEW_CHARS = 2000
 
 
 @dataclass(frozen=True)
@@ -30,6 +40,13 @@ class CandidateFilter:
     sender_domains: tuple[str, ...] = ("erajaya.com",)
     keywords: tuple[str, ...] = ("alokasi", "allocation")
     excluded_subjects: tuple[str, ...] = (OUT_OF_SCOPE_BATAM_SUBJECT,)
+    # Pengirim (huruf kecil) yang emailnya WAJIB diambil walau tidak berbau
+    # alokasi dan walau domainnya bukan sender_domains — daftar dari APEX
+    # (/api/submissions/pengirim-wajib), lihat scripts/process_outlook_allocations.py.
+    wajib_senders: frozenset[str] = frozenset()
+
+    def is_wajib(self, sender: object) -> bool:
+        return bool(self.wajib_senders) and str(sender or "").strip().casefold() in self.wajib_senders
 
     def is_excluded(self, subject: object) -> bool:
         """Return whether an email is explicitly outside the allocation scope."""
@@ -45,18 +62,32 @@ class CandidateFilter:
             return False
 
         sender = get_sender_address(item)
+        if self.is_wajib(sender):
+            return True
+        # Subjek alokasi selalu kandidat, dari domain mana pun (akun Gmail toko,
+        # subjek "REQUEST STOCK … NEW STORE" tanpa kata alokasi).
+        if is_allocation_subject(subject, sender):
+            return True
         sender_domain = sender.rsplit("@", 1)[-1].casefold() if "@" in sender else ""
         if self.sender_domains and sender_domain not in {domain.casefold() for domain in self.sender_domains}:
             return False
 
-        body = " ".join(
-            value
-            for value in (
-                normalize_text(getattr(item, "Body", "")),
-                normalize_text(getattr(item, "HTMLBody", "")),
-            )
-            if value
-        ).casefold()
+        try:
+            body = " ".join(
+                value
+                for value in (
+                    normalize_text(getattr(item, "Body", "")),
+                    normalize_text(getattr(item, "HTMLBody", "")),
+                )
+                if value
+            ).casefold()
+        except Exception:
+            # Some Outlook item types (meeting requests, read receipts, sharing
+            # invites) raise a COM "Not implemented" error reading Body/HTMLBody
+            # instead of returning "" — getattr's default only covers
+            # AttributeError, not COM errors, so this must be caught explicitly
+            # or one such item aborts the entire folder scan.
+            body = ""
         searchable = f"{subject.casefold()} {body}"
         return any(keyword.casefold() in searchable for keyword in self.keywords)
 
@@ -143,6 +174,44 @@ def category_for_result(result: ExtractionResult) -> Optional[str]:
     if result.status is ExtractionStatus.PARTIAL:
         return REVIEW_CATEGORY
     return None
+
+
+def _body_preview(item: Any) -> str:
+    """Isi teks email, dipotong BODY_PREVIEW_CHARS. Item COM tertentu melempar
+    error saat Body dibaca (lihat CandidateFilter.matches) — jadi kosong saja."""
+    try:
+        body = str(getattr(item, "Body", "") or "")
+    except Exception:
+        body = ""
+    # Baris dipertahankan (normalize_text meratakan semua whitespace jadi satu
+    # spasi); cuma spasi berlebih per baris dan baris kosong beruntun yang dirapikan.
+    baris = [re.sub(r"[ \t\u00a0]+", " ", b).strip() for b in body.replace("\r\n", "\n").split("\n")]
+    body = re.sub(r"\n{3,}", "\n\n", "\n".join(baris)).strip()
+    return body[:BODY_PREVIEW_CHARS]
+
+
+def _unreadable_reason(result: ExtractionResult, inspected: Optional[Mapping[str, object]]) -> str:
+    """Kalimat untuk PIC di APEX: kenapa bot gagal + lampiran apa saja yang ada."""
+    reasons = {
+        "no supported allocation table found": "isi email tidak berisi tabel alokasi yang dikenali",
+        "no allocation worksheet found": "lampiran Excel tidak berisi sheet alokasi yang dikenali",
+        "allocation worksheet(s) found but no records extracted": "sheet alokasi ada tapi qty-nya kosong semua",
+        "email has no supported Excel attachment or HTML body": "tidak ada lampiran Excel maupun tabel di isi email",
+    }
+    def explain(error: str) -> str:
+        if error in reasons:
+            return reasons[error]
+        if "unavailable locally" in error or "zip file" in error.casefold() or "not a zip" in error.casefold():
+            return "lampiran tidak bisa dibuka (rusak, terkunci sandi, atau tautan OneDrive/SharePoint)"
+        return error
+    detail = "; ".join(dict.fromkeys(explain(error) for error in result.errors)) or "tidak ada alokasi terbaca"
+    names = [
+        str(attachment.get("filename"))
+        for attachment in ((inspected or {}).get("attachments") or [])
+        if isinstance(attachment, Mapping) and attachment.get("filename")
+        and not re.fullmatch(r"(?i)image\d+\.(png|jpe?g|gif)|untitled attachment.*\.txt|.*\.(ics)", str(attachment.get("filename")))
+    ]
+    return f"Bot: {detail}." + (f" Lampiran: {', '.join(names)}." if names else " Tanpa lampiran.")
 
 
 def _error_result(email_id: str, parser_type: str, message: str) -> ExtractionResult:
@@ -237,9 +306,7 @@ class OutlookEmailScanner:
             self.last_scan_candidates += 1
             email_id = normalize_text(getattr(item, "EntryID", "")) or f"outlook-item-{index}"
             existing_categories = getattr(item, "Categories", "") or ""
-            if {
-                SCRAPED_CATEGORY.casefold(), REVIEW_CATEGORY.casefold()
-            } & {
+            if {category.casefold() for category in BOT_CATEGORIES} & {
                 part.casefold() for part in _category_parts(existing_categories)
             }:
                 summaries.append(self._skipped_summary(item, email_id))
@@ -363,6 +430,24 @@ class OutlookEmailScanner:
             result = _error_result(email_id, "outlook_processing", str(err))
 
         desired_category = category_for_result(result)
+        info_metadata: dict[str, object] = {}
+        if (
+            result.status in {ExtractionStatus.INVALID, ExtractionStatus.UNSUPPORTED}
+            and not result.records
+            and is_allocation_subject(subject, sender)
+        ):
+            # Email alokasi yang isinya tidak terbaca: JANGAN dibuang diam-diam —
+            # kirim ke APEX dengan alasannya supaya PIC mengerjakan manual.
+            desired_category = UNREADABLE_CATEGORY
+            info_metadata = {
+                "tak_terbaca": _unreadable_reason(result, inspected),
+                "body_preview": _body_preview(item),
+            }
+        elif not result.records and self.config.candidate_filter.is_wajib(sender):
+            # Pengirim di daftar wajib, tapi tidak ada alokasi terbaca: tetap
+            # dikirim ke APEX sebagai email info supaya masuk kotak masuk PIC-nya.
+            desired_category = INFO_CATEGORY
+            info_metadata = {"wajib": True, "body_preview": _body_preview(item)}
 
         unread_after = getattr(item, "UnRead", None)
         errors = result.errors if result.status in {ExtractionStatus.INVALID, ExtractionStatus.UNSUPPORTED} else ()
@@ -381,7 +466,7 @@ class OutlookEmailScanner:
             error_information=errors,
             review_information=review,
             unread_status_preserved=unread_before == unread_after,
-            metadata={**result.metadata, "records": result.records},
+            metadata={**result.metadata, "records": result.records, **info_metadata},
         )
         self.repository.record_result(email_id, summary)
         return summary
@@ -397,10 +482,12 @@ class OutlookEmailScanner:
 
         with TemporaryDirectory(prefix="scm-allocation-") as temp_dir:
             attachment_paths: dict[str, Path] = {}
-            for attachment in excel_attachments:
+            for number, attachment in enumerate(excel_attachments):
                 filename = str(getattr(attachment, "FileName", ""))
                 safe_filename = Path(filename).name
-                target = Path(temp_dir) / safe_filename
+                # Satu subfolder per lampiran: dua lampiran bernama sama tidak saling timpa.
+                target = Path(temp_dir) / str(number) / safe_filename
+                target.parent.mkdir()
                 attachment.SaveAsFile(str(target))
                 attachment_paths[filename] = target
             return self.extractor(inspected, attachment_paths=attachment_paths)

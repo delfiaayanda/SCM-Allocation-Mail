@@ -12,7 +12,7 @@ from scm_allocation.parsers import parse_excel, parse_html
 
 
 OUT_OF_SCOPE_BATAM_SUBJECT = "re: sto device alokasi batam asia brand wk36 2026"
-SUPPORTED_ATTACHMENT_EXTENSIONS = frozenset({".xlsx"})
+SUPPORTED_ATTACHMENT_EXTENSIONS = frozenset({".xlsx", ".xlsm", ".xltx", ".xlsb", ".xls", ".csv"})
 
 
 def is_allocation_attachment_filename(filename: object) -> bool:
@@ -84,12 +84,16 @@ def extract_email(
         )
 
     attachments, attachment_diagnostics = classify_attachments(email.get("attachments") or [])
+    # Kunci attachment_paths = FileName mentah dari COM, sedangkan filename di sini
+    # sudah dinormalisasi (spasi ganda jadi satu) — "STO  Alokasi - EVENT.xlsx" dulu
+    # tidak pernah ketemu dan email jatuh ke "unavailable locally".
+    paths_by_name = {normalize_text(name): path for name, path in (attachment_paths or {}).items()}
     excel_results: list[ExtractionResult] = []
     for attachment in attachments:
         filename = normalize_text(attachment.get("filename"))
         if not filename:
             continue
-        filepath = attachment_paths.get(filename) if attachment_paths else None
+        filepath = paths_by_name.get(filename)
         if filepath is None or not filepath.exists():
             excel_results.append(
                 ExtractionResult(
@@ -108,6 +112,7 @@ def extract_email(
                 source_email_id=source_email_id,
                 destination_plant_code=plant_code,
                 destination_plant_description=plant_description,
+                subject=normalize_text(subject),
             )
         )
 
@@ -143,6 +148,21 @@ def extract_email(
                 source_email_id,
                 metadata={"worksheet_diagnostics": diagnostics, "attachment_diagnostics": attachment_diagnostics},
             )
+        # Lampiran Excel-nya bukan tabel alokasi (memo, laporan stok) — alokasinya
+        # bisa saja ditulis sebagai tabel di isi email. Dulu langsung INVALID.
+        html_body = email.get("body_html")
+        if normalize_text(html_body):
+            plant_code, plant_description = _extract_email_plant(email)
+            html_result = parse_html(
+                str(html_body),
+                source_email_id=source_email_id,
+                destination_plant_code=plant_code,
+                destination_plant_description=plant_description,
+            )
+            if html_result.records:
+                html_result.metadata = {**html_result.metadata, "worksheet_diagnostics": diagnostics,
+                                        "attachment_diagnostics": attachment_diagnostics}
+                return html_result
         return ExtractionResult(
             [],
             ExtractionStatus.INVALID,

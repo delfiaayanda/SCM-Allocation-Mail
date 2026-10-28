@@ -145,6 +145,47 @@ def test_real_request_matrix_variant_extracts_body_labeled_plant():
     assert result.records[0].quantity == 1
 
 
+def test_request_matrix_falls_back_when_a_redundant_plant_column_misleads_flat_table_heuristic():
+    """A source-plant column literally named "Plant" also matches the
+    destination_plant_code alias, tricking parse_html into _parse_flat_table
+    (which then fails because there is no plant DESCRIPTION column). Regression
+    for a real roadshow-request email where this caused zero records instead
+    of falling back to the matrix parser."""
+    email = {
+        "entry_id": "roadshow-synthetic",
+        "subject": "Request Stock Acc Erafone Roadshow Kotabaru (XQ63)",
+        "body_plain_text": "Mohon dibantu alokasi Acc untuk kebutuhan Event.",
+        "body_html": """
+            <table>
+              <tr>
+                <th>Plant</th><th>Name 1</th><th>Material Code</th><th>Material description</th>
+                <th>Storage location</th><th>Brand</th><th>BGC1</th><th>Request Event Erafone Region 3 (XQ63)</th>
+              </tr>
+              <tr>
+                <td>BGC1</td><td>ERAFONE MDC CIKUPA</td><td>8100999001</td><td>Sample Acc A</td>
+                <td>1005</td><td>SAMPLE</td><td>10</td><td>3</td>
+              </tr>
+              <tr>
+                <td>BGC1</td><td>ERAFONE MDC CIKUPA</td><td>8100999002</td><td>Sample Acc B</td>
+                <td>1005</td><td>SAMPLE</td><td>18</td><td>2</td>
+              </tr>
+            </table>
+        """,
+        "attachments": [],
+    }
+
+    result = extract_email(email)
+
+    assert result.status is ExtractionStatus.VALID
+    assert result.parser_type == "html_request_matrix"
+    assert len(result.records) == 2
+    assert result.records[0].destination_plant_code == "XQ63"
+    assert result.records[0].issuing_warehouse_code == "BGC1"
+    # The quantity column is "Request Event..." (3, 2) — NOT the "BGC1" stock
+    # column (10, 18) that happens to sit next to it.
+    assert [record.quantity for record in result.records] == [3, 2]
+
+
 def test_batam_samsung_workflow_is_excluded_before_excel_parsing():
     subject = "RE: STO ALOKASI BATAM SAMSUNG DEVICE DAN ACCS WK36 2026"
     email = {

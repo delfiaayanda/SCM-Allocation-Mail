@@ -11,6 +11,7 @@ import openpyxl
 from scm_allocation.models.allocation import AllocationRecord, ExtractionResult, ExtractionStatus
 from scm_allocation.normalization import find_alias_index, normalize_quantity, normalize_text
 from scm_allocation.parsers.common import infer_allocation_context, make_record
+from scm_allocation.parsers.generic import extract_generic_layout
 
 
 def _category_bands(ws: Any, row_number: int) -> list[Optional[str]]:
@@ -323,6 +324,76 @@ def _trim_phantom_cells(workbook: Any) -> None:
             del cells[key]
 
 
+_REFERENCE_TITLE_RE = re.compile(r"^B[A-Z][A-Z0-9]\d$|stock|stok|sales|\bdata\b|master|pvt|pivot|soh|inventory", re.IGNORECASE)
+_REQUEST_TITLE_RE = re.compile(r"req|\bpo\b|alo[ck]asi|alloc|order|\bsto\b|npi|new\s*store|kebutuhan|permintaan", re.IGNORECASE)
+_REFERENCE_HEADERS = {"stor. loc.", "storage location", "unrestricted", "material group", "sales stock", "base unit of measure", "mch 1"}
+
+
+def _is_reference_sheet(title: str, headers: list[Any]) -> bool:
+    """Sheet dump stok/penjualan yang ikut dilampirkan, bukan isi permintaan."""
+    if _REQUEST_TITLE_RE.search(title or ""):
+        return False
+    names = {(normalize_text(h) or "").casefold() for h in headers}
+    return bool(_REFERENCE_TITLE_RE.search(title or "")) or bool(names & _REFERENCE_HEADERS)
+
+
+_SHEET_DATE_RE = re.compile(r"(?<!\d)(\d{2})(\d{2})(\d{2}|\d{4})(?!\d)")
+
+
+def _sheet_date(text: Optional[str]) -> Optional[tuple[int, int, int]]:
+    """Tanggal ddmmyy/ddmmyyyy dari judul sheet atau subjek ("211026", "R2 (23012026)")."""
+    for match in _SHEET_DATE_RE.finditer(text or ""):
+        day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            return (year % 100, month, day)
+    return None
+
+
+def _keep_current_log_sheets(records: list[AllocationRecord], workbook: Any, subject: Optional[str],
+                             diagnostics: list[dict[str, object]]) -> list[AllocationRecord]:
+    """Workbook "log berjalan" (satu sheet per tanggal alokasi, mis. Lamina: 77 sheet
+    sejak Januari) dulu terbaca SELURUHNYA tiap email — alokasi lama ikut lagi.
+    Kalau ≥3 sheet bertanggal: ambil sheet bertanggal sama dengan subjek email,
+    atau kalau tidak ada yang cocok, sheet bertanggal paling baru."""
+    dated = {ws.title: _sheet_date(ws.title) for ws in workbook.worksheets}
+    dated = {title: date for title, date in dated.items() if date}
+    if len(dated) < 3:
+        return records
+    with_records = {r.source_sheet for r in records}
+    candidates = {title: date for title, date in dated.items() if title in with_records}
+    if not candidates:
+        return records
+    target = _sheet_date(subject)
+    if target not in candidates.values():
+        target = max(candidates.values())
+    keep = {title for title, date in candidates.items() if date == target}
+    kept = [r for r in records if r.source_sheet in keep or r.source_sheet not in dated]
+    if len(kept) != len(records):
+        for d in diagnostics:
+            if d["sheet"] in dated and d["sheet"] not in keep and d.get("records"):
+                d["status"], d["reason"] = "dropped_old_log", "sheet tanggal lama di workbook log berjalan"
+    return kept
+
+
+def _freeze_dimensions(workbook: Any) -> None:
+    """Bekukan max_row/max_column tiap sheet setelah _trim_phantom_cells.
+
+    Di openpyxl dua properti itu menyisir SEMUA sel tiap kali dibaca, padahal
+    parser ini membacanya per baris (`_row_values`, `_headers` di dalam loop).
+    Sheet 20 rb baris × 165 rb sel ("PO Multi1 28 Sept.xlsx") jadi miliaran
+    langkah — scan menggantung >5 menit dan RAM membengkak. Ukurannya dihitung
+    sekali di sini; ws.cell() yang membaca sel kosong memang membuat sel baru,
+    tapi tidak lagi menggeser ukuran sheet.
+    """
+    for ws in workbook.worksheets:
+        max_row, max_column = ws.max_row, ws.max_column
+        ws.__class__ = type(
+            "FrozenWorksheet",
+            (ws.__class__,),
+            {"max_row": property(lambda self, v=max_row: v), "max_column": property(lambda self, v=max_column: v)},
+        )
+
+
 def _row_values(ws: Any, row_number: int) -> list[Any]:
     return [ws.cell(row_number, column).value for column in range(1, ws.max_column + 1)]
 
@@ -437,20 +508,132 @@ def _matrix_records(
     return records
 
 
+def _workbook_from_rows(sheets: list[tuple[str, list[list[Any]]]]) -> Any:
+    """Bangun Workbook openpyxl dari baris mentah, supaya semua detektor sheet di
+    bawah (yang memakai API openpyxl) berlaku juga untuk .xlsb/.xls/.csv."""
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)
+    for title, rows in sheets:
+        ws = workbook.create_sheet(re.sub(r"[\\/*?:\[\]]", " ", str(title))[:31] or "Sheet")
+        for r, row in enumerate(rows, start=1):
+            for c, value in enumerate(row, start=1):
+                if value not in (None, ""):
+                    ws.cell(r, c, value)
+    return workbook
+
+
+def load_any_workbook(filepath: Path) -> Any:
+    """Buka lampiran Excel apa pun formatnya: .xlsx/.xlsm/.xltx (openpyxl),
+    .xlsb (pyxlsb), .xls (xlrd), .csv. Ekstensi yang menipu (file .xls yang
+    isinya xlsx, dsb.) dicoba ulang dengan pembaca lain."""
+    suffix = filepath.suffix.casefold()
+
+    def read_xlsb() -> Any:
+        from pyxlsb import open_workbook
+        sheets = []
+        with open_workbook(str(filepath)) as wb:
+            for name in wb.sheets:
+                with wb.get_sheet(name) as sheet:
+                    sheets.append((name, [[cell.v for cell in row] for row in sheet.rows(sparse=True)]))
+        return _workbook_from_rows(sheets)
+
+    def read_xls() -> Any:
+        import xlrd
+        book = xlrd.open_workbook(str(filepath))
+        sheets = []
+        for sheet in book.sheets():
+            rows = []
+            for r in range(sheet.nrows):
+                row = []
+                for c in range(sheet.ncols):
+                    cell = sheet.cell(r, c)
+                    value = cell.value
+                    if cell.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            value = xlrd.xldate.xldate_as_datetime(value, book.datemode)
+                        except Exception:
+                            pass
+                    row.append(value)
+                rows.append(row)
+            sheets.append((sheet.name, rows))
+        return _workbook_from_rows(sheets)
+
+    def read_csv() -> Any:
+        import csv
+        raw = filepath.read_bytes()
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        try:
+            dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        return _workbook_from_rows([(filepath.stem, list(csv.reader(text.splitlines(), dialect)))])
+
+    def read_openpyxl() -> Any:
+        # read_only = streaming, tanpa memuat pivot cache/format: workbook dengan
+        # pivot besar ("REQUEST STOCK DEVICE … X049.xlsx", 7 MB) dulu butuh ~2 menit
+        # hanya untuk dibuka. Nilainya disalin ke Workbook biasa supaya detektor
+        # di bawah tetap bisa memakai ws.cell(); baris kosong beruntun di ujung
+        # sheet yang pernah diformat sampai bawah dihentikan lebih awal.
+        source = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+        try:
+            sheets, hidden = [], set()
+            for ws in source.worksheets:
+                rows, blank_run = [], 0
+                for row in ws.iter_rows(values_only=True):
+                    if any(value is not None for value in row):
+                        rows.extend([[]] * blank_run)
+                        rows.append(list(row))
+                        blank_run = 0
+                    else:
+                        blank_run += 1
+                        if blank_run > 5000:
+                            break
+                sheets.append((ws.title, rows))
+                if getattr(ws, "sheet_state", "visible") != "visible":
+                    hidden.add(ws.title)
+        finally:
+            source.close()
+        workbook = _workbook_from_rows(sheets)
+        for ws in workbook.worksheets:
+            if ws.title in hidden:
+                ws.sheet_state = "hidden"
+        return workbook
+
+    order = {
+        ".xlsb": (read_xlsb, read_openpyxl),
+        ".xls": (read_xls, read_openpyxl),
+        ".csv": (read_csv,),
+    }.get(suffix, (read_openpyxl, read_xlsb, read_xls))
+    last_error: Optional[Exception] = None
+    for reader in order:
+        try:
+            return reader()
+        except Exception as err:  # format salah / file rusak — coba pembaca berikutnya
+            last_error = err
+    raise last_error or ValueError(f"cannot open {filepath.name}")
+
+
 def parse_excel(
     filepath: Path,
     *,
     source_email_id: Optional[str] = None,
     destination_plant_code: Optional[str] = None,
     destination_plant_description: Optional[str] = None,
+    subject: Optional[str] = None,
 ) -> ExtractionResult:
     """Inspect every worksheet and extract records from all supported allocation sheets."""
     parser_type = "excel_compound_grid"
     try:
-        workbook = openpyxl.load_workbook(filepath, data_only=True)
+        workbook = load_any_workbook(filepath)
     except Exception as err:
         return ExtractionResult([], ExtractionStatus.INVALID, parser_type, source_email_id, (str(err),))
     _trim_phantom_cells(workbook)
+    _freeze_dimensions(workbook)
 
     records: list[AllocationRecord] = []
     seen_records: set[tuple[object, ...]] = set()
@@ -696,6 +879,68 @@ def parse_excel(
             "duplicates_skipped": duplicate_records,
             "reason": "no nonblank request quantities" if not sheet_records else None,
         })
+
+    # Sheet yang tidak menghasilkan satu rekaman pun dari parser khusus di atas
+    # dicoba parser generik (header bebas / kode toko sebagai judul kolom).
+    productive = {d["sheet"] for d in diagnostics if d.get("records")}
+    generic_strength: dict[str, int] = {}
+    for worksheet in workbook.worksheets:
+        if worksheet.title in productive or worksheet.sheet_state != "visible":
+            continue
+        rows = [list(row) for row in worksheet.iter_rows(max_row=min(worksheet.max_row, 20000), values_only=True)]
+        generic_records, layout = extract_generic_layout(
+            rows,
+            source_email_id=source_email_id,
+            source_filename=filepath.name,
+            source_sheet=worksheet.title,
+            destination_plant_code=destination_plant_code,
+            destination_plant_description=destination_plant_description,
+            location_prefix=f"{worksheet.title}!",
+        )
+        generic_strength[worksheet.title] = layout["qty_score"] if layout else 0
+        added = 0
+        for record in generic_records:
+            identity = (record.material_code, record.material_description, record.quantity,
+                        record.destination_plant_code, record.issuing_warehouse_code)
+            if identity in seen_records:
+                continue
+            seen_records.add(identity)
+            records.append(record)
+            added += 1
+        if added:
+            matched_sheet_count += 1
+            parser_types.add(generic_records[0].parser_type)
+            diagnostics.append({"workbook": filepath.name, "sheet": worksheet.title, "status": "matched",
+                                "format": generic_records[0].parser_type, "records": added})
+
+    # Sheet generik berkolom qty lemah (pivot "Sum of Quantity", kolom gudang)
+    # dibuang kalau ada sheet generik lain dengan kolom permintaan bernama tegas
+    # (REQ/PO/Alokasi) — itu sheet permintaannya, sisanya data pendukung.
+    generic_sheets = {r.source_sheet for r in records if r.parser_type.startswith("generic_")}
+    strong = {t for t in generic_sheets if generic_strength.get(t, 0) >= 9}
+    weak = {t for t in generic_sheets if generic_strength.get(t, 0) < 9}
+    if strong and weak:
+        records = [r for r in records if r.source_sheet not in weak]
+        for d in diagnostics:
+            if d["sheet"] in weak and str(d.get("format", "")).startswith("generic_"):
+                d["status"], d["reason"] = "dropped_weak", "kolom qty lemah, ada sheet permintaan lain"
+        parser_types = {r.parser_type for r in records}
+
+    # Workbook permintaan sering menyertakan sheet referensi: dump stok SAP
+    # ("Sales Stock", sheet bernama kode gudang BGC1/BFC1, kolom Stor. Loc./
+    # Material Group). Parser tabel sederhana membacanya sebagai alokasi ribuan
+    # baris (28 Okt 2026: 11.373 baris dari satu email permintaan 1 toko). Kalau
+    # ada sheet lain yang menghasilkan rekaman, sheet referensi itu dibuang.
+    reference = {d["sheet"] for d in diagnostics if d.get("records") and _is_reference_sheet(d["sheet"], d.get("headers") or [])}
+    if reference and any(r.source_sheet not in reference for r in records):
+        records = [r for r in records if r.source_sheet not in reference]
+        for d in diagnostics:
+            if d["sheet"] in reference and d.get("records"):
+                d["status"], d["reason"] = "dropped_reference", "sheet referensi stok, bukan permintaan"
+        parser_types = {r.parser_type for r in records}
+
+    records = _keep_current_log_sheets(records, workbook, subject, diagnostics)
+    parser_types = {r.parser_type for r in records} or parser_types
 
     metadata = {"worksheet_diagnostics": diagnostics}
     if not records:
