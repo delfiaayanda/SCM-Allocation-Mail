@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import re
 import sys
 from tempfile import TemporaryDirectory
@@ -31,6 +32,16 @@ INFO_CATEGORY = "SCM Bot - Info"
 UNREADABLE_CATEGORY = "SCM Bot - Tak Terbaca"
 BOT_CATEGORIES = (SCRAPED_CATEGORY, REVIEW_CATEGORY, INFO_CATEGORY, UNREADABLE_CATEGORY)
 BODY_PREVIEW_CHARS = 2000
+# Lampiran disimpan sebentar ke folder sementara di drive E (C: dijaga lega,
+# 28 Okt 2026) dan langsung dihapus sesudah diparse. Drive E tidak ada → Temp sistem.
+ATTACHMENT_TEMP_DIR = os.getenv("SCM_ATTACHMENT_TEMP_DIR", r"E:\Apex Back Up\Email\tmp")
+
+
+def _attachment_temp_root() -> Optional[str]:
+    if not os.path.isdir(os.path.dirname(ATTACHMENT_TEMP_DIR.rstrip("\\/"))):
+        return None
+    os.makedirs(ATTACHMENT_TEMP_DIR, exist_ok=True)
+    return ATTACHMENT_TEMP_DIR
 
 
 @dataclass(frozen=True)
@@ -496,7 +507,7 @@ class OutlookEmailScanner:
         if not excel_attachments:
             return self.extractor(inspected)
 
-        with TemporaryDirectory(prefix="scm-allocation-") as temp_dir:
+        with TemporaryDirectory(prefix="scm-allocation-", dir=_attachment_temp_root()) as temp_dir:
             attachment_paths: dict[str, Path] = {}
             for number, attachment in enumerate(excel_attachments):
                 filename = str(getattr(attachment, "FileName", ""))
