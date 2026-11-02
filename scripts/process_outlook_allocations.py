@@ -165,12 +165,21 @@ def main() -> int:
         if sys.platform != "win32":
             print("[SCM] ERROR: Outlook COM automation cuma jalan di Windows.", flush=True)
             return 1
+        import time
         import win32com.client
-        try:
-            outlook_application = win32com.client.Dispatch("Outlook.Application")
-        except Exception as err:
-            print(f"[SCM] ERROR: Failed to connect to Outlook desktop: {err}", flush=True)
-            return 1
+        # "Server execution failed" (-2146959355) muncul kalau Outlook sedang
+        # menutup/membuka (2 Nov 2026 23:00: Outlook baru hidup lagi 23:10).
+        # Coba ulang beberapa kali sebelum menyerah.
+        for attempt in range(1, 5):
+            try:
+                outlook_application = win32com.client.Dispatch("Outlook.Application")
+                break
+            except Exception as err:
+                if attempt == 4:
+                    print(f"[SCM] ERROR: Failed to connect to Outlook desktop: {err}", flush=True)
+                    return 1
+                print(f"[SCM] Outlook belum siap ({err}); coba lagi {attempt}/3 dalam 30 dtk...", flush=True)
+                time.sleep(30)
     try:
         summaries = scanner.scan(outlook_application=outlook_application)
     except Exception as err:
