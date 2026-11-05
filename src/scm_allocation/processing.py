@@ -493,7 +493,10 @@ class OutlookEmailScanner:
             error_information=errors,
             review_information=review,
             unread_status_preserved=unread_before == unread_after,
-            metadata={**result.metadata, "records": result.records, **info_metadata},
+            # body_preview untuk SEMUA email (5 Nov 2026): APEX menyimpannya supaya
+            # kotak masuk bisa dicari berdasarkan isi email, bukan cuma subjek/pengirim.
+            metadata={**result.metadata, "records": result.records,
+                      "body_preview": _body_preview(item), **info_metadata},
         )
         self.repository.record_result(email_id, summary)
         return summary

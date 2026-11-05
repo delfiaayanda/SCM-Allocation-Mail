@@ -63,7 +63,9 @@ def _push_and_categorize(summaries, *, outlook, write_categories: bool,
                 api_base=api_base, machine_key=machine_key, source_id=source_id,
                 email_id=summary.email_id, sender=summary.sender, subject=summary.subject,
                 records=records,
-                body_preview=summary.metadata.get("body_preview") if info or tak_terbaca or catatan_bot else None,
+                # Semua email (bukan cuma info/tak terbaca): APEX memakainya untuk
+                # pencarian isi email. Tidak ikut hash arsip email alokasi.
+                body_preview=summary.metadata.get("body_preview"),
                 tak_terbaca=tak_terbaca,
                 catatan_bot=catatan_bot,
             )
