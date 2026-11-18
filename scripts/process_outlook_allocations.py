@@ -153,6 +153,7 @@ def main() -> int:
         max_emails=args.max_emails,
         dry_run=scan_dry_run,
         candidate_filter=CandidateFilter(wajib_senders=wajib),
+        invalid_cache_path=str(Path(__file__).resolve().parent.parent / "data" / "invalid_cache.json"),
     )
     history_logger = CsvProcessingLogger(Path("logs"))
     scanner = OutlookEmailScanner(

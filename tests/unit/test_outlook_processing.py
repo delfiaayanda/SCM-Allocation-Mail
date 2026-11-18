@@ -660,3 +660,45 @@ def test_category_failure_does_not_stop_later_category_write():
     assert second.Categories == f"Blue Category, {REVIEW_CATEGORY}"
     assert first.UnRead == first_unread_before
     assert second.UnRead == second_unread_before
+
+
+def test_invalid_without_category_is_cached_and_not_reparsed(tmp_path: Path):
+    """18 Nov 2026: email INVALID tanpa kategori dulu diurai ulang tiap run (+-430/jam)."""
+    cache = tmp_path / "invalid_cache.json"
+    calls: list[str] = []
+
+    def extractor(email, **kwargs):
+        calls.append("x")
+        return result(ExtractionStatus.INVALID)
+
+    def run():
+        scanner = OutlookEmailScanner(
+            config=OutlookScanConfig(dry_run=True, invalid_cache_path=str(cache)),
+            extractor=extractor,
+        )
+        scanner.scan(FakeOutlook(FakeFolder([FakeItem(subject="Undangan rapat mingguan", categories="", email_id="junk")])))
+        return scanner
+
+    first = run()
+    assert len(calls) == 1 and first.last_skipped_invalid_cached == 0
+    second = run()
+    assert len(calls) == 1, "email INVALID yang sama tidak boleh diurai lagi"
+    assert second.last_skipped_invalid_cached == 1
+    assert second.last_invalid_or_excluded_count == 1
+
+
+def test_invalid_cache_resets_when_wajib_senders_change(tmp_path: Path):
+    cache = tmp_path / "invalid_cache.json"
+    calls: list[str] = []
+
+    def run(wajib):
+        scanner = OutlookEmailScanner(
+            config=OutlookScanConfig(dry_run=True, invalid_cache_path=str(cache),
+                                     candidate_filter=CandidateFilter(wajib_senders=frozenset(wajib))),
+            extractor=lambda email, **kw: (calls.append("x"), result(ExtractionStatus.INVALID))[1],
+        )
+        scanner.scan(FakeOutlook(FakeFolder([FakeItem(subject="Undangan rapat mingguan", categories="", email_id="junk")])))
+
+    run(set())
+    run({"baru@erajaya.com"})
+    assert len(calls) == 2

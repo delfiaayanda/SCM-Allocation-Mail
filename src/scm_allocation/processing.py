@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import os
+import json
+import hashlib
 import re
 import sys
 from tempfile import TemporaryDirectory
@@ -116,6 +118,8 @@ class OutlookScanConfig:
     max_emails: Optional[int] = None
     dry_run: bool = True
     candidate_filter: CandidateFilter = field(default_factory=CandidateFilter)
+    # File cache email kandidat yang hasilnya INVALID tanpa kategori (None = mati).
+    invalid_cache_path: Optional[str] = None
 
 
 @dataclass
@@ -173,6 +177,73 @@ class InMemoryEmailProcessingRepository(EmailProcessingRepository):
 
     def get_processing_status(self, email_id: str) -> Optional[ProcessingSummary]:
         return self._results.get(email_id)
+
+
+class InvalidEmailCache:
+    """EntryID email kandidat yang hasilnya INVALID tanpa kategori Outlook.
+
+    Email ini tidak diberi kategori bot, jadi dulu diurai ulang (termasuk buka
+    lampiran) di SETIAP run: +-430 email/jam untuk hasil yang sama (18 Nov 2026).
+    Sidik = hash kode paket scm_allocation + daftar pengirim wajib: parser
+    diubah atau pengirim baru masuk daftar wajib -> cache otomatis kosong lagi.
+    """
+
+    def __init__(self, path: Optional[str], candidate_filter: "CandidateFilter") -> None:
+        self.path = path
+        self.entries: dict[str, dict[str, str]] = {}
+        self.dirty = False
+        if not path:
+            self.fingerprint = ""
+            return
+        self.fingerprint = self._fingerprint(candidate_filter)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("sidik") == self.fingerprint:
+                self.entries = dict(data.get("email") or {})
+            else:
+                self.dirty = True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            self.dirty = True
+
+    @staticmethod
+    def _fingerprint(candidate_filter: "CandidateFilter") -> str:
+        h = hashlib.sha256()
+        pkg = Path(__file__).resolve().parent
+        for f in sorted(pkg.rglob("*.py")):
+            h.update(f.relative_to(pkg).as_posix().encode())
+            h.update(f.read_bytes())
+        for s in sorted(candidate_filter.wajib_senders):
+            h.update(s.encode("utf-8"))
+        return h.hexdigest()[:16]
+
+    def has(self, email_id: str) -> bool:
+        return bool(self.path) and email_id in self.entries
+
+    def add(self, email_id: str, subject: str) -> None:
+        if not self.path:
+            return
+        self.entries[email_id] = {"subjek": (subject or "")[:120],
+                                  "sejak": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        self.dirty = True
+
+    def save(self, keep_ids: Optional[set] = None) -> None:
+        if not self.path:
+            return
+        if keep_ids is not None:
+            before = len(self.entries)
+            self.entries = {k: v for k, v in self.entries.items() if k in keep_ids}
+            self.dirty = self.dirty or len(self.entries) != before
+        if not self.dirty:
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"sidik": self.fingerprint, "email": self.entries}, f, ensure_ascii=False)
+        os.replace(tmp, self.path)
+        self.dirty = False
 
 
 def _category_parts(categories: object) -> list[str]:
@@ -248,6 +319,10 @@ class OutlookEmailScanner:
     ) -> None:
         self.repository = repository or InMemoryEmailProcessingRepository()
         self.config = config or OutlookScanConfig()
+        self.invalid_cache = InvalidEmailCache(
+            self.config.invalid_cache_path, self.config.candidate_filter
+        )
+        self.last_skipped_invalid_cached = 0
         self.extractor = extractor
         self.progress_callback = progress_callback
         self.category_writer_factory = category_writer_factory or OutlookCategoryWriter
@@ -301,6 +376,8 @@ class OutlookEmailScanner:
         self.last_invalid_or_excluded_count = 0
         self.last_write_failure_count = 0
         self.last_error_count = 0
+        self.last_skipped_invalid_cached = 0
+        seen_ids: set[str] = set()
 
         for index in range(1, fetch_count + 1):
             self.last_scan_inspected += 1
@@ -329,7 +406,16 @@ class OutlookEmailScanner:
                 self.last_skipped_already_processed += 1
                 self._report_progress(f"SKIPPED_ALREADY_PROCESSED: {getattr(item, 'Subject', '<No Subject>')}")
                 continue
+            seen_ids.add(email_id)
+            if self.invalid_cache.has(email_id):
+                # Sudah pernah diurai dengan kode & daftar wajib yang sama dan hasilnya
+                # INVALID tanpa kategori -> hasilnya pasti sama; jangan buka lampiran lagi.
+                self.last_skipped_invalid_cached += 1
+                self.last_invalid_or_excluded_count += 1
+                continue
             summary = self._process_item(item, index, email_id)
+            if summary.category is None and summary.metadata.get("_cacheable_invalid"):
+                self.invalid_cache.add(email_id, summary.subject)
             summaries.append(summary)
             processed_items.append((item, summary))
             self.last_processed_count += 1
@@ -345,7 +431,13 @@ class OutlookEmailScanner:
 
         self._report_progress(
             f"Inspected {self.last_scan_inspected} item(s); found {self.last_scan_candidates} candidate(s)."
+            + (f" {self.last_skipped_invalid_cached} INVALID dilewati dari cache."
+               if self.last_skipped_invalid_cached else "")
         )
+        # Cache cuma hasil klasifikasi (tidak menulis ke Outlook/APEX), jadi aman
+        # disimpan juga saat scan() dry-run (mode --push-to-apex). Email yang sudah
+        # tidak ada di folder dibuang hanya kalau seluruh folder dipindai.
+        self.invalid_cache.save(keep_ids=seen_ids if fetch_count == total_count else None)
         if not self.config.dry_run and pending_writes:
             self._report_write_summary(summaries, pending_writes)
             self._write_categories(pending_writes, getattr(namespace, "Categories", None))
@@ -439,10 +531,12 @@ class OutlookEmailScanner:
         sender = get_sender_address(item)
         received_at = str(getattr(item, "ReceivedTime", "<Unknown>"))
         inspected = None
+        crashed = False
         try:
             inspected = inspect_email_item(item, index)
             result = self._extract_inspected_email(item, inspected)
         except Exception as err:
+            crashed = True
             result = _error_result(email_id, "outlook_processing", str(err))
 
         desired_category = category_for_result(result)
@@ -496,7 +590,11 @@ class OutlookEmailScanner:
             # body_preview untuk SEMUA email (5 Nov 2026): APEX menyimpannya supaya
             # kotak masuk bisa dicari berdasarkan isi email, bukan cuma subjek/pengirim.
             metadata={**result.metadata, "records": result.records,
-                      "body_preview": _body_preview(item), **info_metadata},
+                      "body_preview": _body_preview(item), **info_metadata,
+                      # Error Outlook/lampiran bisa sementara -> jangan di-cache.
+                      "_cacheable_invalid": (not crashed and desired_category is None
+                                             and result.status in {ExtractionStatus.INVALID,
+                                                                   ExtractionStatus.UNSUPPORTED})},
         )
         self.repository.record_result(email_id, summary)
         return summary
