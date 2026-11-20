@@ -702,3 +702,38 @@ def test_invalid_cache_resets_when_wajib_senders_change(tmp_path: Path):
     run(set())
     run({"baru@erajaya.com"})
     assert len(calls) == 2
+
+
+def test_max_age_days_stops_at_first_old_email():
+    # 20 Nov 2026: folder diurut terbaru dulu -> scan berhenti di email pertama
+    # yang lebih tua dari batas; email lama di bawahnya tidak dibaca sama sekali.
+    from datetime import datetime as _dt, timedelta as _td
+    baru = FakeItem(email_id="baru", categories="Blue Category")
+    baru.ReceivedTime = _dt.now() - _td(days=2)
+    lama = FakeItem(email_id="lama", categories="Blue Category")
+    lama.ReceivedTime = _dt.now() - _td(days=40)
+    tak_tersentuh = FakeItem(email_id="lebih-lama", categories="Blue Category")
+    tak_tersentuh.ReceivedTime = _dt.now() - _td(days=50)
+    calls: list[str] = []
+
+    def extractor(email, **kwargs):
+        calls.append(email["entry_id"])
+        return result(ExtractionStatus.VALID)
+
+    scanner = OutlookEmailScanner(config=OutlookScanConfig(dry_run=True, max_age_days=21), extractor=extractor)
+    summaries = scanner.scan(FakeOutlook(FakeFolder([baru, lama, tak_tersentuh])))
+
+    assert [s.email_id for s in summaries] == ["baru"]
+    assert calls == ["baru"]
+    assert scanner.last_scan_inspected == 2
+    assert scanner.last_scan_stopped_by_age is True
+
+
+def test_max_age_days_ignored_when_received_time_unreadable():
+    # ReceivedTime tak terbaca (bukan datetime) -> email tetap diperiksa, tidak berhenti.
+    item = FakeItem(email_id="x", categories="Blue Category")
+    item.ReceivedTime = "bukan tanggal"
+    scanner = OutlookEmailScanner(config=OutlookScanConfig(dry_run=True, max_age_days=21),
+                                  extractor=lambda email, **kw: result(ExtractionStatus.VALID))
+    assert [s.email_id for s in scanner.scan(FakeOutlook(FakeFolder(item)))] == ["x"]
+    assert scanner.last_scan_stopped_by_age is False

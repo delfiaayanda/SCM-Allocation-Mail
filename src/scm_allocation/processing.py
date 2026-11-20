@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import os
 import json
@@ -116,6 +116,10 @@ class OutlookScanConfig:
 
     folder_name: str = "Inbox"
     max_emails: Optional[int] = None
+    # Berhenti di email pertama yang lebih tua dari N hari (folder diurut terbaru
+    # dulu). None = seluruh folder. 20 Nov 2026: tiap run memeriksa 9.000+ email
+    # (baca Body via COM) padahal >99% sudah berkategori bot.
+    max_age_days: Optional[int] = None
     dry_run: bool = True
     candidate_filter: CandidateFilter = field(default_factory=CandidateFilter)
     # File cache email kandidat yang hasilnya INVALID tanpa kategori (None = mati).
@@ -330,6 +334,7 @@ class OutlookEmailScanner:
         self.last_scan_inspected = 0
         self.last_scan_candidates = 0
         self.last_scan_total = 0
+        self.last_scan_stopped_by_age = False
         self.last_processed_count = 0
         self.last_skipped_already_processed = 0
         self.last_scraped_count = 0
@@ -350,10 +355,15 @@ class OutlookEmailScanner:
         folder = self._resolve_folder(namespace)
         self._report_progress(f"Scanning folder: {self.config.folder_name}.")
         items = folder.Items
+        urut = True
         try:
             items.Sort("[ReceivedTime]", True)
         except Exception:
-            pass
+            urut = False
+        batas_umur = None
+        if self.config.max_age_days and urut:
+            batas_umur = datetime.now() - timedelta(days=self.config.max_age_days)
+        self.last_scan_stopped_by_age = False
 
         try:
             total_count = int(getattr(items, "Count", 0))
@@ -390,6 +400,16 @@ class OutlookEmailScanner:
                 self.last_error_count += 1
                 self._report_progress(f"ERROR retrieving Outlook item {index}: {err}")
                 continue
+            if batas_umur is not None:
+                try:
+                    diterima = item.ReceivedTime
+                    diterima = datetime(diterima.year, diterima.month, diterima.day,
+                                        diterima.hour, diterima.minute, diterima.second)
+                except Exception:
+                    diterima = None
+                if diterima is not None and diterima < batas_umur:
+                    self.last_scan_stopped_by_age = True
+                    break
             subject = normalize_text(getattr(item, "Subject", "")) or ""
             if self.config.candidate_filter.is_excluded(subject):
                 self.last_invalid_or_excluded_count += 1
@@ -404,7 +424,6 @@ class OutlookEmailScanner:
             }:
                 summaries.append(self._skipped_summary(item, email_id))
                 self.last_skipped_already_processed += 1
-                self._report_progress(f"SKIPPED_ALREADY_PROCESSED: {getattr(item, 'Subject', '<No Subject>')}")
                 continue
             seen_ids.add(email_id)
             if self.invalid_cache.has(email_id):
@@ -431,13 +450,17 @@ class OutlookEmailScanner:
 
         self._report_progress(
             f"Inspected {self.last_scan_inspected} item(s); found {self.last_scan_candidates} candidate(s)."
+            + (f" {self.last_skipped_already_processed} sudah diproses (dilewati)."
+               if self.last_skipped_already_processed else "")
+            + (f" Berhenti di email > {self.config.max_age_days} hari." if self.last_scan_stopped_by_age else "")
             + (f" {self.last_skipped_invalid_cached} INVALID dilewati dari cache."
                if self.last_skipped_invalid_cached else "")
         )
         # Cache cuma hasil klasifikasi (tidak menulis ke Outlook/APEX), jadi aman
         # disimpan juga saat scan() dry-run (mode --push-to-apex). Email yang sudah
         # tidak ada di folder dibuang hanya kalau seluruh folder dipindai.
-        self.invalid_cache.save(keep_ids=seen_ids if fetch_count == total_count else None)
+        full = fetch_count == total_count and not self.last_scan_stopped_by_age
+        self.invalid_cache.save(keep_ids=seen_ids if full else None)
         if not self.config.dry_run and pending_writes:
             self._report_write_summary(summaries, pending_writes)
             self._write_categories(pending_writes, getattr(namespace, "Categories", None))

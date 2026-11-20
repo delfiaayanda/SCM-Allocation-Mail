@@ -108,6 +108,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Scan Outlook allocation emails safely.")
     parser.add_argument("--folder", default="Inbox", help="Outlook folder name; default: Inbox")
     parser.add_argument("--max-emails", type=int, default=None, help="Maximum newest items to inspect; omitted scans the full folder")
+    # 20 Nov 2026: bawaan 21 hari -- email lebih tua hampir semuanya sudah berkategori
+    # bot; 0 = seluruh folder (mis. sesudah robot mati lama).
+    parser.add_argument("--max-age-days", type=int, default=21, help="Stop at the first item older than N days; 0 scans the full folder")
     parser.add_argument(
         "--write-categories",
         action="store_true",
@@ -151,6 +154,7 @@ def main() -> int:
     config = OutlookScanConfig(
         folder_name=args.folder,
         max_emails=args.max_emails,
+        max_age_days=args.max_age_days or None,
         dry_run=scan_dry_run,
         candidate_filter=CandidateFilter(wajib_senders=wajib),
         invalid_cache_path=str(Path(__file__).resolve().parent.parent / "data" / "invalid_cache.json"),
@@ -205,6 +209,8 @@ def main() -> int:
     )
 
     for summary in summaries:
+        if summary.skipped:  # sudah berkategori bot: cukup angka di "Inspected ..."
+            continue
         details = summary.error_information or summary.review_information
         detail_text = f" | details={' ; '.join(details)}" if details else ""
         status = "SKIPPED_ALREADY_PROCESSED" if summary.skipped else summary.extraction_status.value.upper()
